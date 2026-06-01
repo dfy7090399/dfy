@@ -371,3 +371,7 @@ class Game {
         requestAnimationFrame((time) => this.gameLoop(time));
     }
 }
+
+window.addEventListener('DOMContentLoaded', () => {
+    new Game();
+});
