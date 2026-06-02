@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bid Proposal Agent</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <main class="app-shell">
+        <header class="site-header">
+            <div class="brand-mark">BPA</div>
+            <nav class="top-nav" aria-label="页面导航">
+                <a href="#inputs">材料输入</a>
+                <a href="#settings">生成设置</a>
+                <a href="#post-processing">后处理</a>
+                <a href="#summary">摘要</a>
+            </nav>
+        </header>
+
+        <section class="hero">
+            <div class="hero-copy">
+                <p class="eyebrow">FDE Proposal Workflow</p>
+                <h1>Bid Proposal Agent</h1>
+                <p class="summary">面向售前/FDE 的方案生成工作台，聚合规范书、评分标准、模板和后处理规则。</p>
+            </div>
+
+            <div class="hero-metrics" aria-label="工作流指标">
+                <div>
+                    <strong>03</strong>
+                    <span>输入材料</span>
+                </div>
+                <div>
+                    <strong>08</strong>
+                    <span>标题层级</span>
+                </div>
+                <div>
+                    <strong>DOCX</strong>
+                    <span>默认模板</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="workspace">
+            <form id="proposalForm" class="upload-panel">
+                <section id="inputs" class="panel-section">
+                    <div class="section-title">
+                        <p class="section-kicker">01 / MATERIALS</p>
+                        <h2>材料输入</h2>
+                    </div>
+
+                    <div class="upload-grid">
+                        <label class="upload-card required" for="technicalSpecification">
+                            <span class="tag">必传</span>
+                            <span class="title">技术规范书</span>
+                            <span class="description">解析项目范围、技术要求、产品能力要求和交付约束。</span>
+                            <input id="technicalSpecification" name="technicalSpecification" type="file" accept=".pdf,.doc,.docx,.txt,.md" required>
+                            <span class="file-name" data-file-name="technicalSpecification">未选择文件</span>
+                        </label>
+
+                        <label class="upload-card required" for="scoringCriteria">
+                            <span class="tag">必传</span>
+                            <span class="title">评分标准</span>
+                            <span class="description">提取评分项、分值权重、应答重点和得分策略。</span>
+                            <input id="scoringCriteria" name="scoringCriteria" type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.csv,.txt,.md" required>
+                            <span class="file-name" data-file-name="scoringCriteria">未选择文件</span>
+                        </label>
+
+                        <label class="upload-card optional" for="templateFile">
+                            <span class="tag">可选</span>
+                            <span class="title">方案编写模板</span>
+                            <span class="description">继承项目目录结构、章节顺序、标题风格和格式规范。</span>
+                            <input id="templateFile" name="templateFile" type="file" accept=".doc,.docx,.pdf,.txt,.md">
+                            <span class="file-name" data-file-name="templateFile">未选择文件</span>
+                        </label>
+                    </div>
+                </section>
+
+                <section id="settings" class="panel-section generation-settings" aria-label="生成设置">
+                    <div class="section-title">
+                        <p class="section-kicker">02 / GENERATION</p>
+                        <h2>生成设置</h2>
+                    </div>
+
+                    <div class="field-grid">
+                        <label>
+                            <span>输出类型</span>
+                            <select id="outputType" name="outputType">
+                                <option value="technical">技术方案</option>
+                                <option value="business">商务应答</option>
+                                <option value="poc">POC 实施方案</option>
+                                <option value="security">安全建设方案</option>
+                            </select>
+                        </label>
+
+                        <label>
+                            <span>项目名称</span>
+                            <input id="projectName" name="projectName" type="text" placeholder="例如：某集团安全运营中心建设项目">
+                        </label>
+                    </div>
+                </section>
+
+                <section id="post-processing" class="panel-section heading-settings" aria-label="标题调整">
+                    <div class="section-title">
+                        <p class="section-kicker">03 / HEADING</p>
+                        <h2>标题调整</h2>
+                    </div>
+
+                    <div class="heading-controls">
+                        <label>
+                            <span>全局标题操作</span>
+                            <select id="globalHeadingAction" name="globalHeadingAction">
+                                <option value="none">不调整</option>
+                                <option value="demote">所有标题降一级</option>
+                                <option value="promote">所有标题升一级</option>
+                            </select>
+                        </label>
+
+                        <label>
+                            <span>最大标题级别</span>
+                            <select id="maxHeadingLevel" name="maxHeadingLevel">
+                                <option value="8">标题 8</option>
+                                <option value="7">标题 7</option>
+                                <option value="6">标题 6</option>
+                                <option value="5">标题 5</option>
+                                <option value="4">标题 4</option>
+                            </select>
+                        </label>
+                    </div>
+
+                    <div class="chapter-rules">
+                        <div class="chapter-rule">
+                            <label>
+                                <span>指定章节标题</span>
+                                <input id="chapterTitleA" name="chapterTitleA" type="text" placeholder="例如：项目概述">
+                            </label>
+                            <label>
+                                <span>调整为</span>
+                                <select id="chapterLevelA" name="chapterLevelA">
+                                    <option value="">不设置</option>
+                                    <option value="1">标题 1</option>
+                                    <option value="2">标题 2</option>
+                                    <option value="3">标题 3</option>
+                                    <option value="4">标题 4</option>
+                                    <option value="5">标题 5</option>
+                                    <option value="6">标题 6</option>
+                                    <option value="7">标题 7</option>
+                                    <option value="8">标题 8</option>
+                                </select>
+                            </label>
+                        </div>
+
+                        <div class="chapter-rule">
+                            <label>
+                                <span>指定章节标题</span>
+                                <input id="chapterTitleB" name="chapterTitleB" type="text" placeholder="例如：评分策略">
+                            </label>
+                            <label>
+                                <span>调整为</span>
+                                <select id="chapterLevelB" name="chapterLevelB">
+                                    <option value="">不设置</option>
+                                    <option value="1">标题 1</option>
+                                    <option value="2">标题 2</option>
+                                    <option value="3">标题 3</option>
+                                    <option value="4">标题 4</option>
+                                    <option value="5">标题 5</option>
+                                    <option value="6">标题 6</option>
+                                    <option value="7">标题 7</option>
+                                    <option value="8">标题 8</option>
+                                </select>
+                            </label>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel-section page-plan-settings" aria-label="篇幅规划">
+                    <div class="section-title">
+                        <p class="section-kicker">04 / LENGTH</p>
+                        <h2>篇幅规划</h2>
+                    </div>
+
+                    <div class="page-plan-controls">
+                        <label>
+                            <span>总体编写页数</span>
+                            <input id="totalPages" name="totalPages" type="number" min="1" max="500" placeholder="例如：60">
+                        </label>
+
+                        <label>
+                            <span>分配模式</span>
+                            <select id="pageAllocationMode" name="pageAllocationMode">
+                                <option value="auto">按大纲自动分配</option>
+                                <option value="manual">手动指定章节页数</option>
+                                <option value="hybrid">自动分配后允许手动微调</option>
+                            </select>
+                        </label>
+                    </div>
+
+                    <div class="chapter-page-rules">
+                        <div class="chapter-page-rule">
+                            <label>
+                                <span>章节名称</span>
+                                <input id="pageChapterTitleA" name="pageChapterTitleA" type="text" placeholder="例如：项目概述">
+                            </label>
+                            <label>
+                                <span>页数</span>
+                                <input id="pageChapterCountA" name="pageChapterCountA" type="number" min="1" max="500" placeholder="例如：5">
+                            </label>
+                        </div>
+
+                        <div class="chapter-page-rule">
+                            <label>
+                                <span>章节名称</span>
+                                <input id="pageChapterTitleB" name="pageChapterTitleB" type="text" placeholder="例如：技术方案">
+                            </label>
+                            <label>
+                                <span>页数</span>
+                                <input id="pageChapterCountB" name="pageChapterCountB" type="number" min="1" max="500" placeholder="例如：20">
+                            </label>
+                        </div>
+
+                        <div class="chapter-page-rule">
+                            <label>
+                                <span>章节名称</span>
+                                <input id="pageChapterTitleC" name="pageChapterTitleC" type="text" placeholder="例如：实施计划">
+                            </label>
+                            <label>
+                                <span>页数</span>
+                                <input id="pageChapterCountC" name="pageChapterCountC" type="number" min="1" max="500" placeholder="例如：8">
+                            </label>
+                        </div>
+                    </div>
+                </section>
+
+                <div class="actions">
+                    <button type="submit">生成并预览大纲</button>
+                    <button type="button" id="composeBtn" class="compose-btn" disabled>确认大纲并开始编写</button>
+                    <button type="button" id="resetBtn" class="secondary">清空</button>
+                </div>
+            </form>
+
+            <section id="summary" class="preview-panel" aria-live="polite">
+                <p class="section-kicker">05 / JSON PREVIEW</p>
+                <h2>生成结果</h2>
+                <div id="resultLinks" class="result-links" hidden></div>
+                <section class="outline-panel">
+                    <div class="outline-header">
+                        <h3>生成大纲</h3>
+                        <span id="outlineStatus">等待生成</span>
+                    </div>
+                    <div id="outlineOutput" class="outline-output empty">上传材料并生成后，会在这里展示可确认的大纲。</div>
+                </section>
+                <section class="compose-progress" id="composeProgress" hidden>
+                    <div class="outline-header">
+                        <h3>编写进展</h3>
+                        <span id="composeStatus">等待确认</span>
+                    </div>
+                    <ol id="composeSteps">
+                        <li data-step="confirm">确认大纲</li>
+                        <li data-step="compose">正式编写</li>
+                        <li data-step="export">生成正式稿</li>
+                        <li data-step="done">完成</li>
+                    </ol>
+                </section>
+                <pre id="summaryOutput">等待上传文件...</pre>
+            </section>
+        </section>
+    </main>
+    <script src="app.js"></script>
+</body>
+</html>
