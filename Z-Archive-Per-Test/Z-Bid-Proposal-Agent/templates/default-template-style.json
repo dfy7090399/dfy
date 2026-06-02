@@ -1,0 +1,84 @@
+{
+  "source": "templates/default-proposal-template.docx",
+  "description": "Default fallback proposal template style profile extracted from the provided Word template.",
+  "fallbackBehavior": {
+    "whenUploadedTemplateMissing": "Use templates/default-proposal-template.docx as the canonical proposal template.",
+    "generationRule": "Preserve heading levels and spacing from the Word template before filling generated proposal content."
+  },
+  "styles": [
+    {
+      "level": 1,
+      "styleName": "Heading 1",
+      "sampleText": "标题 1",
+      "font": "Times New Roman",
+      "fontSizePt": 20,
+      "bold": true,
+      "spaceBeforePt": 20,
+      "spaceAfterPt": 6
+    },
+    {
+      "level": 2,
+      "styleName": "Heading 2",
+      "sampleText": "标题2",
+      "font": "Times New Roman",
+      "fontSizePt": 16,
+      "bold": true,
+      "spaceBeforePt": 18,
+      "spaceAfterPt": 6
+    },
+    {
+      "level": 3,
+      "styleName": "Heading 3",
+      "sampleText": "标题3",
+      "font": "Times New Roman",
+      "fontSizePt": 14,
+      "bold": true,
+      "spaceBeforePt": 16,
+      "spaceAfterPt": 4
+    },
+    {
+      "level": 4,
+      "styleName": "Heading 4",
+      "sampleText": "标题4",
+      "font": "Times New Roman",
+      "bold": true,
+      "spaceBeforePt": 14,
+      "spaceAfterPt": 4
+    },
+    {
+      "level": 5,
+      "styleName": "Heading 5",
+      "sampleText": "标题 5",
+      "font": "Times New Roman",
+      "bold": true,
+      "spaceBeforePt": 12,
+      "spaceAfterPt": 4
+    },
+    {
+      "level": 6,
+      "styleName": "Heading 6",
+      "sampleText": "标题 6",
+      "italic": true,
+      "color": "666666",
+      "spaceBeforePt": 12,
+      "spaceAfterPt": 4
+    },
+    {
+      "level": 7,
+      "styleName": "Heading 7",
+      "sampleText": "标题 7",
+      "bold": true,
+      "spaceBeforePt": 12,
+      "spaceAfterPt": 3.2,
+      "lineSpacing": 1.3333333333333333
+    },
+    {
+      "level": 8,
+      "styleName": "Heading 8",
+      "sampleText": "标题 8",
+      "spaceBeforePt": 12,
+      "spaceAfterPt": 3.2,
+      "lineSpacing": 1.3333333333333333
+    }
+  ]
+}
