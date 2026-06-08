@@ -5,6 +5,12 @@
     "whenUploadedTemplateMissing": "Use templates/default-proposal-template.docx as the canonical proposal template.",
     "generationRule": "Preserve heading levels and spacing from the Word template before filling generated proposal content."
   },
+  "bodyStyle": {
+    "styleNames": ["Normal", "Body Text"],
+    "firstLineIndentChars": 2,
+    "firstLineIndentPt": 28,
+    "generationRule": "All generated body paragraphs should use a first-line indent of two Chinese characters. Heading paragraphs and table cells are excluded."
+  },
   "styles": [
     {
       "level": 1,

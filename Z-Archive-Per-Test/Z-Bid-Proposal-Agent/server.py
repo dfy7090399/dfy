@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from docx import Document
+from docx.shared import Pt
 
 from agents import run_pipeline
 
@@ -26,17 +27,89 @@ BASE_DIR = Path(__file__).resolve().parent
 SRC_DIR = BASE_DIR / "src"
 TEMPLATE_DIR = BASE_DIR / "templates"
 OUTPUT_DIR = BASE_DIR / "output"
+CONFIG_DIR = BASE_DIR / "config"
+MODEL_CONFIG_FILE = CONFIG_DIR / "model-config.json"
+MODEL_CONFIG_LOCAL_FILE = CONFIG_DIR / "model-config.local.json"
 DEFAULT_TEMPLATE = TEMPLATE_DIR / "default-proposal-template.docx"
 DEFAULT_STYLE = TEMPLATE_DIR / "default-template-style.json"
 TARGET_CHARS_PER_PAGE = 590
 MIN_CHILD_CHARS = 260
+BODY_FIRST_LINE_INDENT = Pt(28)
 COMPOSE_STATUS_FILE = "compose-status.json"
-LLM_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "")
-CODEX_WRITER_ENABLED = os.environ.get("CODEX_WRITER_ENABLED", "1") != "0"
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 ACTIVE_COMPOSE_TASKS: set[str] = set()
 ACTIVE_COMPOSE_LOCK = threading.Lock()
+
+DEFAULT_MODEL_CONFIG = {
+    "writer": {
+        "providerPriority": ["codex", "openai", "local"],
+    },
+    "codex": {
+        "enabled": True,
+        "useCurrentLogin": True,
+        "model": "",
+        "timeoutSeconds": 240,
+    },
+    "openai": {
+        "enabled": True,
+        "baseUrl": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini",
+        "apiKeyEnv": "OPENAI_API_KEY",
+        "apiKey": "",
+    },
+    "local": {
+        "enabled": True,
+    },
+}
+
+
+def deep_merge(base, override):
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def read_json_file(path):
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def load_model_config():
+    config = deep_merge(DEFAULT_MODEL_CONFIG, read_json_file(MODEL_CONFIG_FILE))
+    config = deep_merge(config, read_json_file(MODEL_CONFIG_LOCAL_FILE))
+    config_env = config.get("env", {})
+    if config_env:
+        config = deep_merge(config, {
+            "writer": {
+                "providerPriority": ["anthropic", "codex", "openai", "local"],
+            },
+            "anthropic": {
+                "enabled": True,
+                "baseUrl": config_env.get("ANTHROPIC_BASE_URL", ""),
+                "model": config_env.get("ANTHROPIC_MODEL")
+                    or config_env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+                    or config_env.get("ANTHROPIC_DEFAULT_OPUS_MODEL")
+                    or config_env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+                    or "",
+                "apiKeyEnv": "ANTHROPIC_AUTH_TOKEN",
+                "apiKey": config_env.get("ANTHROPIC_AUTH_TOKEN", ""),
+            },
+        })
+    return config
+
+
+def env_bool(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 class ProposalHandler(SimpleHTTPRequestHandler):
@@ -66,12 +139,27 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             return
 
     def do_GET(self):
+        if self.path == "/api/proposals/latest":
+            try:
+                self.send_json(self.handle_latest_proposal(), HTTPStatus.OK)
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return
+
         if self.path.startswith("/api/proposals/") and self.path.endswith("/compose/status"):
             try:
                 job_id = self.path.removeprefix("/api/proposals/").removesuffix("/compose/status").strip("/")
                 self.send_json(self.handle_compose_status(job_id), HTTPStatus.OK)
             except ValueError as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        if self.path.startswith("/api/proposals/"):
+            try:
+                job_id = self.path.removeprefix("/api/proposals/").strip("/")
+                self.send_json(self.handle_proposal_detail(job_id), HTTPStatus.OK)
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
             return
 
         if self.path.startswith("/output/"):
@@ -86,6 +174,62 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             return
 
         super().do_HEAD()
+
+    def handle_latest_proposal(self):
+        job_dirs = [
+            path for path in OUTPUT_DIR.iterdir()
+            if path.is_dir() and (path / "manifest.json").exists()
+        ]
+        if not job_dirs:
+            raise ValueError("暂无历史任务")
+
+        job_dir = max(job_dirs, key=lambda path: (path / "manifest.json").stat().st_mtime)
+        job_id = job_dir.name
+        manifest = json.loads((job_dir / "manifest.json").read_text(encoding="utf-8"))
+        pipeline_result = {}
+        pipeline_path = job_dir / "pipeline-result.json"
+        if pipeline_path.exists():
+            pipeline_result = json.loads(pipeline_path.read_text(encoding="utf-8"))
+
+        return {
+            "message": "已恢复最近任务",
+            "jobId": job_id,
+            **self.build_proposal_detail(job_dir, manifest, pipeline_result),
+        }
+
+    def handle_proposal_detail(self, job_id):
+        job_dir = (OUTPUT_DIR / safe_job_id(job_id)).resolve()
+        if not str(job_dir).startswith(str(OUTPUT_DIR.resolve())) or not job_dir.is_dir():
+            raise ValueError("任务不存在")
+
+        manifest_path = job_dir / "manifest.json"
+        if not manifest_path.exists():
+            raise ValueError("任务清单不存在")
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        pipeline_result = {}
+        pipeline_path = job_dir / "pipeline-result.json"
+        if pipeline_path.exists():
+            pipeline_result = json.loads(pipeline_path.read_text(encoding="utf-8"))
+
+        return {
+            "message": "已恢复任务",
+            "jobId": job_dir.name,
+            **self.build_proposal_detail(job_dir, manifest, pipeline_result),
+        }
+
+    def build_proposal_detail(self, job_dir, manifest, pipeline_result):
+        job_id = job_dir.name
+        return {
+            "manifest": manifest,
+            "outline": pipeline_result.get("outline", {}).get("sections", []),
+            "composeStatus": self.compose_status_for_response(job_id, job_dir),
+            "manifestUrl": f"/output/{job_id}/manifest.json",
+            "draftUrl": f"/output/{job_id}/proposal-draft.md",
+            "finalDraftUrl": f"/output/{job_id}/proposal-final-draft.md" if (job_dir / "proposal-final-draft.md").exists() else "",
+            "finalDocxUrl": f"/output/{job_id}/proposal-final.docx" if (job_dir / "proposal-final.docx").exists() else "",
+            "pipelineUrl": f"/output/{job_id}/pipeline-result.json",
+        }
 
     def handle_proposal_request(self):
         form = self.parse_multipart_form()
@@ -158,12 +302,10 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             raise ValueError("任务缺少大纲结果，请重新生成大纲")
 
         status = self.read_compose_status(job_dir)
-        if status.get("state") in {"queued", "running"}:
-            return status
 
         with ACTIVE_COMPOSE_LOCK:
             if job_id in ACTIVE_COMPOSE_TASKS:
-                return self.read_compose_status(job_dir)
+                return status
             ACTIVE_COMPOSE_TASKS.add(job_id)
 
         initial_status = {
@@ -177,6 +319,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             "startedAt": datetime.now(timezone.utc).isoformat(),
             "updatedAt": datetime.now(timezone.utc).isoformat(),
             "engine": self.writer_engine_name(),
+            "model": self.writer_model_name(),
             "llmEnabled": self.llm_enabled(),
             "warning": self.writer_warning(),
             "manifestUrl": f"/output/{job_id}/manifest.json",
@@ -191,7 +334,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
         job_dir = (OUTPUT_DIR / safe_job_id(job_id)).resolve()
         if not str(job_dir).startswith(str(OUTPUT_DIR.resolve())) or not job_dir.is_dir():
             raise ValueError("任务不存在")
-        return self.read_compose_status(job_dir)
+        return self.compose_status_for_response(job_id, job_dir)
 
     def run_compose_task(self, job_id):
         job_dir = OUTPUT_DIR / safe_job_id(job_id)
@@ -210,6 +353,8 @@ class ProposalHandler(SimpleHTTPRequestHandler):
                 "stage": "planning",
                 "progress": 3,
                 "message": "正在规划章节篇幅与写作任务",
+                "engine": self.writer_engine_name(),
+                "model": self.writer_model_name(),
                 "pageAllocations": page_allocations,
             })
             final_path.write_text(self.build_final_draft(manifest, outline, page_allocations), encoding="utf-8")
@@ -268,8 +413,26 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             "progress": 0,
             "message": "等待确认大纲并开始编写",
             "engine": self.writer_engine_name(),
+            "model": self.writer_model_name(),
             "llmEnabled": self.llm_enabled(),
         }
+
+    def compose_status_for_response(self, job_id, job_dir):
+        status = self.read_compose_status(job_dir)
+        status.setdefault("engine", self.writer_engine_name())
+        status.setdefault("model", self.writer_model_name())
+        if status.get("state") in {"queued", "running"}:
+            with ACTIVE_COMPOSE_LOCK:
+                is_active = job_id in ACTIVE_COMPOSE_TASKS
+            if not is_active:
+                status = {
+                    **status,
+                    "state": "failed",
+                    "stage": "interrupted",
+                    "message": "后台写作任务已中断，请重新点击确认大纲并开始编写",
+                    "progress": status.get("progress", 0),
+                }
+        return status
 
     def write_compose_status(self, job_dir, status):
         status["updatedAt"] = datetime.now(timezone.utc).isoformat()
@@ -356,7 +519,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
                     "",
                     "### 正文草稿",
                     "",
-                    *self.compose_section_markdown(section, page_map.get(section.get("title"), 1)),
+                    *self.compose_section_markdown(section, page_map.get(section.get("title"), 1), use_writer=False),
                     "",
                 ]
             )
@@ -371,12 +534,6 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             "targetCharsPerPage": TARGET_CHARS_PER_PAGE,
             "sections": [],
         }
-
-        document.add_heading(manifest["projectName"], level=1)
-        document.add_paragraph("正式方案初稿")
-        document.add_paragraph(
-            "本文件基于评分标准生成方案大纲，并结合技术规范书作为正文编写材料；未上传模板时采用内置兜底模板样式。"
-        )
 
         page_map = {item["title"]: item["pages"] for item in page_allocations}
         total_target_pages = sum(item.get("pages", 0) for item in page_allocations)
@@ -400,8 +557,6 @@ class ProposalHandler(SimpleHTTPRequestHandler):
                 })
             section_start_chars = self.document_text_length(document)
             document.add_heading(title, level=1)
-            document.add_paragraph(f"本章节目标篇幅：约 {target_pages} 页。")
-            document.add_paragraph(section.get("writingGoal", "围绕本章节生成可交付内容。"))
             self.add_section_table(document, title)
 
             children = section.get("children") or [{"title": "章节内容"}]
@@ -417,12 +572,23 @@ class ProposalHandler(SimpleHTTPRequestHandler):
                         "message": f"正在编写：{title} / {subtitle}",
                         "currentSection": title,
                         "currentSubtitle": subtitle,
+                        "engine": self.writer_engine_name(),
+                        "model": self.writer_model_name(),
                         "progress": max(6, round(completed_children * 90 / total_children)),
                     })
                 child_start_chars = self.document_text_length(document)
                 document.add_heading(subtitle, level=2)
-                for paragraph in self.compose_paragraphs(title, subtitle, section, technical_signals, target_chars=child_budget):
-                    document.add_paragraph(paragraph)
+                child_progress = max(6, round(completed_children * 90 / total_children))
+                for paragraph in self.compose_paragraphs(
+                    title,
+                    subtitle,
+                    section,
+                    technical_signals,
+                    target_chars=child_budget,
+                    progress_callback=progress_callback,
+                    base_progress=child_progress,
+                ):
+                    self.add_body_paragraph(document, paragraph)
                 child_chars = self.document_text_length(document) - child_start_chars
                 completed_children += 1
                 child_stats.append({
@@ -458,6 +624,11 @@ class ProposalHandler(SimpleHTTPRequestHandler):
         page_control["totalEstimatedPages"] = round(total_chars / TARGET_CHARS_PER_PAGE, 2)
         page_control["totalTargetPages"] = sum(item.get("pages", 0) for item in page_allocations)
         return page_control
+
+    def add_body_paragraph(self, document, text=""):
+        paragraph = document.add_paragraph(text)
+        paragraph.paragraph_format.first_line_indent = BODY_FIRST_LINE_INDENT
+        return paragraph
 
     def clear_document(self, document):
         body = document._element.body
@@ -502,23 +673,38 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             return 0.97
         return 1.0
 
-    def compose_section_markdown(self, section, pages):
+    def compose_section_markdown(self, section, pages, use_writer=True):
         lines = []
         children = section.get("children") or [{"title": "章节内容"}]
         for child in children:
             lines.append(f"#### {child.get('title')}")
             lines.append("")
-            child_budget = max(MIN_CHILD_CHARS, round((pages * TARGET_CHARS_PER_PAGE) / max(1, len(children))))
-            lines.extend(self.compose_paragraphs(section.get("title", ""), child.get("title", ""), section, [], target_chars=child_budget))
+            if use_writer:
+                child_budget = max(MIN_CHILD_CHARS, round((pages * TARGET_CHARS_PER_PAGE) / max(1, len(children))))
+                lines.extend(self.compose_paragraphs(section.get("title", ""), child.get("title", ""), section, [], target_chars=child_budget))
+            else:
+                lines.extend([
+                    "- 正式正文将在确认编写后由后台写作引擎逐小节生成。",
+                    "- 本小节需结合评分项、技术规范书和模板格式进行展开。",
+                    "- 生成过程中可在页面查看当前章节、小节和写作进度。",
+                ])
             lines.append("")
         return lines
 
-    def compose_paragraphs(self, section_title, subtitle, section, technical_signals, target_chars=None):
+    def compose_paragraphs(self, section_title, subtitle, section, technical_signals, target_chars=None, progress_callback=None, base_progress=0):
         scoring_items = section.get("relatedScoringItems") or []
         scoring_text = self.clean_text(scoring_items[0]) if scoring_items else "围绕评分标准要求进行针对性响应。"
         context = self.context_summary(technical_signals)
         target_chars = max(MIN_CHILD_CHARS, int(target_chars or TARGET_CHARS_PER_PAGE))
-        paragraphs = self.compose_paragraphs_with_llm(section_title, subtitle, scoring_text, context, target_chars)
+        paragraphs = self.compose_paragraphs_with_llm(
+            section_title,
+            subtitle,
+            scoring_text,
+            context,
+            target_chars,
+            progress_callback=progress_callback,
+            base_progress=base_progress,
+        )
         if paragraphs and self.paragraphs_text_length(paragraphs) >= target_chars * 0.9:
             return paragraphs
 
@@ -546,7 +732,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
 
         return paragraphs
 
-    def compose_paragraphs_with_llm(self, section_title, subtitle, scoring_text, context, target_chars):
+    def compose_paragraphs_with_llm(self, section_title, subtitle, scoring_text, context, target_chars, progress_callback=None, base_progress=0):
         if not self.llm_enabled():
             return []
 
@@ -584,7 +770,13 @@ class ProposalHandler(SimpleHTTPRequestHandler):
 4. 不要输出标题、编号、Markdown、项目符号。
 5. 段落之间用换行分隔。
 """
-        text = self.call_codex_exec(prompt) or self.call_openai_chat(prompt)
+        text = self.call_configured_llm(
+            prompt,
+            progress_callback=progress_callback,
+            section_title=section_title,
+            subtitle=subtitle,
+            base_progress=base_progress,
+        )
         paragraphs = []
         for line in text.splitlines():
             line = self.clean_text(line)
@@ -592,10 +784,33 @@ class ProposalHandler(SimpleHTTPRequestHandler):
                 self.append_unique_paragraph(paragraphs, line)
         return paragraphs
 
-    def call_codex_exec(self, prompt):
+    def call_configured_llm(self, prompt, progress_callback=None, section_title="", subtitle="", base_progress=0):
+        for provider in self.writer_provider_priority():
+            if provider == "anthropic" and self.anthropic_enabled():
+                text = self.call_anthropic_messages(prompt)
+                if text:
+                    return text
+            if provider == "codex" and self.codex_enabled():
+                text = self.call_codex_exec(
+                    prompt,
+                    progress_callback=progress_callback,
+                    section_title=section_title,
+                    subtitle=subtitle,
+                    base_progress=base_progress,
+                )
+                if text:
+                    return text
+            if provider == "openai" and self.openai_enabled():
+                text = self.call_openai_chat(prompt)
+                if text:
+                    return text
+        return ""
+
+    def call_codex_exec(self, prompt, progress_callback=None, section_title="", subtitle="", base_progress=0):
         if not self.codex_enabled():
             return ""
         output_path = OUTPUT_DIR / f"codex-last-message-{uuid.uuid4().hex}.txt"
+        codex_model = self.codex_model()
         command = [
             "codex",
             "exec",
@@ -605,20 +820,45 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             "--output-last-message",
             str(output_path),
         ]
-        if CODEX_MODEL:
-            command.extend(["--model", CODEX_MODEL])
+        if codex_model:
+            command.extend(["--model", codex_model])
         command.append("-")
         try:
-            subprocess.run(
+            started = time.monotonic()
+            process = subprocess.Popen(
                 command,
-                input=prompt,
                 text=True,
                 cwd=str(BASE_DIR),
+                env=self.model_subprocess_env(),
+                stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=240,
-                check=False,
             )
+            if process.stdin:
+                process.stdin.write(prompt)
+                process.stdin.close()
+
+            while process.poll() is None:
+                elapsed = round(time.monotonic() - started)
+                if elapsed > self.codex_timeout_seconds():
+                    process.kill()
+                    process.wait(timeout=5)
+                    return ""
+                if progress_callback:
+                    progress_callback({
+                        "state": "running",
+                        "stage": "model",
+                        "message": f"正在调用模型生成正文：{section_title} / {subtitle}（已耗时 {elapsed} 秒）",
+                        "currentSection": section_title,
+                        "currentSubtitle": subtitle,
+                        "progress": min(94, max(base_progress, base_progress + min(3, elapsed // 30))),
+                        "engine": self.writer_engine_name(),
+                        "model": self.writer_model_name(),
+                        "modelElapsedSeconds": elapsed,
+                        "heartbeatAt": datetime.now(timezone.utc).isoformat(),
+                    })
+                time.sleep(5)
+
             if output_path.exists():
                 return output_path.read_text(encoding="utf-8", errors="ignore").strip()
         except (subprocess.SubprocessError, OSError):
@@ -630,12 +870,46 @@ class ProposalHandler(SimpleHTTPRequestHandler):
                 pass
         return ""
 
-    def call_openai_chat(self, prompt):
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
+    def call_anthropic_messages(self, prompt):
+        config = self.anthropic_config()
+        api_key = self.anthropic_api_key()
+        base_url = (config.get("baseUrl") or "").rstrip("/")
+        model = self.anthropic_model()
+        if not (api_key and base_url and model):
             return ""
         payload = {
-            "model": LLM_MODEL,
+            "model": model,
+            "max_tokens": int(config.get("maxTokens", 1800)),
+            "messages": [
+                {"role": "user", "content": prompt},
+            ],
+        }
+        request = urllib.request.Request(
+            f"{base_url}/messages",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "x-api-key": api_key,
+                "anthropic-version": str(config.get("version", "2023-06-01")),
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=int(config.get("timeoutSeconds", 90))) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            content = data.get("content", [])
+            return "\n".join(item.get("text", "") for item in content if isinstance(item, dict)).strip()
+        except (urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError, TimeoutError):
+            return ""
+
+    def call_openai_chat(self, prompt):
+        api_key = self.openai_api_key()
+        if not api_key:
+            return ""
+        config = self.openai_config()
+        payload = {
+            "model": self.openai_model(),
             "messages": [
                 {"role": "system", "content": "你是严谨、专业、懂网络安全售前投标的中文方案写作智能体。"},
                 {"role": "user", "content": prompt},
@@ -643,7 +917,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             "temperature": 0.35,
         }
         request = urllib.request.Request(
-            f"{OPENAI_BASE_URL}/chat/completions",
+            f"{self.openai_base_url()}/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             headers={
                 "Authorization": f"Bearer {api_key}",
@@ -652,31 +926,117 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=90) as response:
+            with urllib.request.urlopen(request, timeout=int(config.get("timeoutSeconds", 90))) as response:
                 data = json.loads(response.read().decode("utf-8"))
             return data["choices"][0]["message"]["content"]
         except (urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError):
             return ""
 
     def codex_enabled(self):
-        return CODEX_WRITER_ENABLED and shutil.which("codex") is not None
+        return env_bool("CODEX_WRITER_ENABLED", bool(self.codex_config().get("enabled", True))) and shutil.which("codex") is not None
+
+    def anthropic_enabled(self):
+        return bool(self.anthropic_config().get("enabled", True)) and bool(self.anthropic_api_key())
+
+    def openai_enabled(self):
+        return bool(self.openai_config().get("enabled", True)) and bool(self.openai_api_key())
+
+    def current_model_config(self):
+        return load_model_config()
+
+    def current_config_env(self):
+        env = self.current_model_config().get("env", {})
+        return {str(key): str(value) for key, value in env.items()}
+
+    def model_subprocess_env(self):
+        env = os.environ.copy()
+        env.update(self.current_config_env())
+        return env
+
+    def writer_config(self):
+        return self.current_model_config().get("writer", {})
+
+    def codex_config(self):
+        return self.current_model_config().get("codex", {})
+
+    def anthropic_config(self):
+        return self.current_model_config().get("anthropic", {})
+
+    def openai_config(self):
+        return self.current_model_config().get("openai", {})
+
+    def codex_model(self):
+        return os.environ.get("CODEX_MODEL") or self.current_config_env().get("CODEX_MODEL") or self.codex_config().get("model", "")
+
+    def codex_timeout_seconds(self):
+        return int(os.environ.get("CODEX_TIMEOUT_SECONDS") or self.current_config_env().get("CODEX_TIMEOUT_SECONDS") or self.codex_config().get("timeoutSeconds", 240))
+
+    def anthropic_model(self):
+        env = self.current_config_env()
+        return os.environ.get("ANTHROPIC_MODEL") or env.get("ANTHROPIC_MODEL") or self.anthropic_config().get("model", "")
+
+    def anthropic_api_key(self):
+        env = self.current_config_env()
+        key_env = self.anthropic_config().get("apiKeyEnv", "ANTHROPIC_AUTH_TOKEN")
+        return os.environ.get(key_env) or env.get(key_env) or self.anthropic_config().get("apiKey", "")
+
+    def openai_model(self):
+        return os.environ.get("OPENAI_MODEL") or self.current_config_env().get("OPENAI_MODEL") or self.openai_config().get("model", "gpt-4o-mini")
+
+    def openai_base_url(self):
+        return (os.environ.get("OPENAI_BASE_URL") or self.current_config_env().get("OPENAI_BASE_URL") or self.openai_config().get("baseUrl", "https://api.openai.com/v1")).rstrip("/")
+
+    def openai_api_key(self):
+        env = self.current_config_env()
+        key_env = os.environ.get("OPENAI_API_KEY_ENV") or env.get("OPENAI_API_KEY_ENV") or self.openai_config().get("apiKeyEnv", "OPENAI_API_KEY")
+        return os.environ.get(key_env) or env.get(key_env) or self.openai_config().get("apiKey", "") or os.environ.get("OPENAI_API_KEY", "")
 
     def llm_enabled(self):
-        return self.codex_enabled() or bool(os.environ.get("OPENAI_API_KEY"))
+        return self.anthropic_enabled() or self.codex_enabled() or self.openai_enabled()
+
+    def writer_provider_priority(self):
+        priority = self.writer_config().get("providerPriority", ["codex", "openai", "local"])
+        return [str(item).strip().lower() for item in priority if str(item).strip()]
+
+    def active_writer_provider(self):
+        for provider in self.writer_provider_priority():
+            if provider == "anthropic" and self.anthropic_enabled():
+                return "anthropic"
+            if provider == "codex" and self.codex_enabled():
+                return "codex"
+            if provider == "openai" and self.openai_enabled():
+                return "openai"
+            if provider == "local":
+                return "local"
+        return "local"
 
     def writer_engine_name(self):
-        if self.codex_enabled():
-            return f"Codex CLI{f'({CODEX_MODEL})' if CODEX_MODEL else ''}"
-        if os.environ.get("OPENAI_API_KEY"):
-            return f"OpenAI API({LLM_MODEL})"
+        provider = self.active_writer_provider()
+        if provider == "anthropic":
+            return "Anthropic-compatible API"
+        if provider == "codex":
+            return "Codex CLI"
+        if provider == "openai":
+            return "OpenAI API"
         return "local-fallback-writer"
 
+    def writer_model_name(self):
+        provider = self.active_writer_provider()
+        if provider == "anthropic":
+            return self.anthropic_model()
+        if provider == "codex":
+            codex_model = self.codex_model()
+            if codex_model:
+                return f"{codex_model}（由配置或 CODEX_MODEL 指定）"
+            return "Codex CLI 当前默认模型（跟随本机 Codex 登录/配置）"
+        if provider == "openai":
+            return self.openai_model()
+        return "local-template-writer"
+
     def writer_warning(self):
-        if self.codex_enabled():
+        if self.active_writer_provider() != "local":
             return ""
-        if os.environ.get("OPENAI_API_KEY"):
-            return ""
-        return "未检测到 Codex CLI 或 OPENAI_API_KEY，当前为本地降级写作模式。"
+        return "未检测到可用模型配置，当前为本地降级写作模式。"
 
     def paragraphs_text_length(self, paragraphs):
         return sum(len(paragraph) for paragraph in paragraphs)

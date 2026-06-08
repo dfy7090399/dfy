@@ -260,6 +260,16 @@
                         <li data-step="export">生成正式稿</li>
                         <li data-step="done">完成</li>
                     </ol>
+                    <div class="progress-meter" aria-label="编写进度">
+                        <div class="progress-meter-track">
+                            <span id="composeProgressBar" style="width: 0%"></span>
+                        </div>
+                        <div class="progress-meter-meta">
+                            <span id="composeProgressPercent">0%</span>
+                            <span id="composeProgressModel">等待模型</span>
+                        </div>
+                    </div>
+                    <div class="progress-live" id="composeLiveDetail">等待确认大纲。</div>
                 </section>
                 <pre id="summaryOutput">等待上传文件...</pre>
             </section>

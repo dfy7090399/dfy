@@ -46,6 +46,66 @@ open src/index.html
 
 静态方式只支持本地摘要预览，不会保存上传文件或生成任务输出。
 
+## 模型配置
+
+模型相关配置位于：
+
+```text
+config/model-config.json
+```
+
+系统会在每次模型调用前重新读取模型配置，因此用户修改 `model-config` 后，下一次章节编写会自动使用最新配置。
+
+默认策略是优先使用配置文件中的模型信息；如果配置了 `env.ANTHROPIC_*`，会优先调用 Anthropic-compatible Messages API。未配置专用 API 时，使用本机 `Codex CLI` 当前登录态和当前默认模型，也就是跟随用户在 Codex 中已经填写/登录的模型信息。
+
+本机私有配置可复制示例文件：
+
+```bash
+cp config/model-config.local.example.json config/model-config.local.json
+```
+
+`config/model-config.local.json` 已加入 `.gitignore`，可用于本机覆盖模型、API 地址或 API Key，不会提交到仓库。推荐优先使用环境变量保存密钥：
+
+```bash
+export OPENAI_API_KEY="你的 API Key"
+```
+
+配置优先级：
+
+- 环境变量优先级最高，例如 `ANTHROPIC_MODEL`、`ANTHROPIC_AUTH_TOKEN`、`CODEX_MODEL`、`OPENAI_MODEL`、`OPENAI_BASE_URL`、`OPENAI_API_KEY`。
+- 其次读取 `config/model-config.local.json`。
+- 再读取 `config/model-config.json`。
+- 如果配置文件包含 `env.ANTHROPIC_*`，默认 `providerPriority` 为 `anthropic -> codex -> openai -> local`。
+- 否则默认 `providerPriority` 为 `codex -> openai -> local`。
+
+当前支持这种用户登录/模型配置格式：
+
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "不要提交真实密钥",
+    "ANTHROPIC_BASE_URL": "https://example.com/api/anthropic/v1",
+    "ANTHROPIC_MODEL": "your-model-name"
+  }
+}
+```
+
+服务端会把 `env` 中的变量注入模型调用环境，并用于正文编写。
+
+如果希望强制使用 OpenAI API，可在本机 local 配置中调整：
+
+```json
+{
+  "writer": {
+    "providerPriority": ["openai", "codex", "local"]
+  },
+  "openai": {
+    "model": "gpt-4o-mini",
+    "apiKeyEnv": "OPENAI_API_KEY"
+  }
+}
+```
+
 ## 子智能体架构
 
 当前 MVP 按 5 个子智能体组织：

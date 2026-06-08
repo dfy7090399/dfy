@@ -1,0 +1,21 @@
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "",
+    "ANTHROPIC_BASE_URL": "https://example.com/api/anthropic/v1",
+    "ANTHROPIC_MODEL": "your-model-name"
+  },
+  "writer": {
+    "providerPriority": ["anthropic", "codex", "openai", "local"]
+  },
+  "codex": {
+    "enabled": true,
+    "model": ""
+  },
+  "openai": {
+    "enabled": true,
+    "baseUrl": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini",
+    "apiKeyEnv": "OPENAI_API_KEY",
+    "apiKey": ""
+  }
+}

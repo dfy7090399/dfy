@@ -8,9 +8,14 @@ const outlineStatus = document.getElementById('outlineStatus');
 const composeProgress = document.getElementById('composeProgress');
 const composeStatus = document.getElementById('composeStatus');
 const composeSteps = document.getElementById('composeSteps');
+const composeProgressBar = document.getElementById('composeProgressBar');
+const composeProgressPercent = document.getElementById('composeProgressPercent');
+const composeProgressModel = document.getElementById('composeProgressModel');
+const composeLiveDetail = document.getElementById('composeLiveDetail');
 
 const fileInputs = ['technicalSpecification', 'scoringCriteria', 'templateFile'];
 const defaultTemplatePath = 'templates/default-proposal-template.docx';
+const currentJobStorageKey = 'bidProposalAgent.currentJobId';
 let currentJobId = null;
 let composePollTimer = null;
 
@@ -91,8 +96,17 @@ function renderResultLinks(payload) {
     `;
 }
 
+function rememberCurrentJob(jobId) {
+    if (jobId) {
+        window.localStorage.setItem(currentJobStorageKey, jobId);
+    } else {
+        window.localStorage.removeItem(currentJobStorageKey);
+    }
+}
+
 function setComposeReady(jobId) {
     currentJobId = jobId || null;
+    rememberCurrentJob(currentJobId);
     composeBtn.disabled = !currentJobId;
     if (currentJobId) {
         resetComposeProgress('大纲已生成，等待确认');
@@ -103,6 +117,7 @@ function setComposeReady(jobId) {
 function resetComposeProgress(status = '等待确认') {
     composeStatus.textContent = status;
     composeProgress.hidden = true;
+    updateProgressMeter({ progress: 0, model: '等待模型', message: status });
     composeSteps.querySelectorAll('li').forEach((item) => {
         item.className = '';
     });
@@ -121,6 +136,30 @@ function setComposeStep(step, status) {
             item.className = 'active';
         }
     });
+}
+
+function updateProgressMeter(payload) {
+    const progress = Math.max(0, Math.min(100, Number(payload.progress || 0)));
+    const model = payload.model || payload.engine || '未选择模型';
+    const details = [
+        payload.message || '等待任务状态',
+        payload.currentSection ? `章节：${payload.currentSection}` : '',
+        payload.currentSubtitle ? `小节：${payload.currentSubtitle}` : '',
+        payload.modelElapsedSeconds ? `模型调用耗时：${payload.modelElapsedSeconds} 秒` : ''
+    ].filter(Boolean);
+
+    if (composeProgressBar) {
+        composeProgressBar.style.width = `${progress}%`;
+    }
+    if (composeProgressPercent) {
+        composeProgressPercent.textContent = `${progress}%`;
+    }
+    if (composeProgressModel) {
+        composeProgressModel.textContent = model;
+    }
+    if (composeLiveDetail) {
+        composeLiveDetail.textContent = details.join(' / ');
+    }
 }
 
 function stopComposePolling() {
@@ -277,6 +316,7 @@ form.addEventListener('submit', (event) => {
             renderResultLinks(payload);
             renderOutline(payload.outline || []);
             setComposeReady(payload.jobId);
+            rememberCurrentJob(payload.jobId);
             summaryOutput.textContent = JSON.stringify(payload, null, 2);
         })
         .catch((error) => {
@@ -330,40 +370,45 @@ composeBtn.addEventListener('click', () => {
 
 function startComposePolling(jobId) {
     stopComposePolling();
+    fetchComposeStatus(jobId);
     composePollTimer = window.setInterval(() => {
-        fetch(`/api/proposals/${jobId}/compose/status`)
-            .then((response) => response.json().then((payload) => ({ ok: response.ok, payload })))
-            .then(({ ok, payload }) => {
-                if (!ok) {
-                    throw new Error(payload.error || '获取编写状态失败');
-                }
+        fetchComposeStatus(jobId);
+    }, 1200);
+}
 
-                renderComposeStatus(payload);
-                if (payload.state === 'completed') {
-                    stopComposePolling();
-                    renderResultLinks(payload);
-                    setComposeStep('done', '编写完成，可下载 Word 方案');
-                    composeBtn.textContent = '确认大纲并开始编写';
-                    composeBtn.disabled = false;
-                }
-                if (payload.state === 'failed') {
-                    stopComposePolling();
-                    composeStatus.textContent = '编写失败';
-                    composeBtn.textContent = '确认大纲并开始编写';
-                    composeBtn.disabled = false;
-                }
-            })
-            .catch((error) => {
+function fetchComposeStatus(jobId) {
+    fetch(`/api/proposals/${jobId}/compose/status`)
+        .then((response) => response.json().then((payload) => ({ ok: response.ok, payload })))
+        .then(({ ok, payload }) => {
+            if (!ok) {
+                throw new Error(payload.error || '获取编写状态失败');
+            }
+
+            renderComposeStatus(payload);
+            if (payload.state === 'completed') {
                 stopComposePolling();
-                composeStatus.textContent = '状态获取失败';
-                summaryOutput.textContent = JSON.stringify({
-                    error: error.message,
-                    jobId
-                }, null, 2);
+                renderResultLinks(payload);
+                setComposeStep('done', '编写完成，可下载 Word 方案');
                 composeBtn.textContent = '确认大纲并开始编写';
                 composeBtn.disabled = false;
-            });
-    }, 1200);
+            }
+            if (payload.state === 'failed') {
+                stopComposePolling();
+                composeStatus.textContent = '编写失败';
+                composeBtn.textContent = '确认大纲并开始编写';
+                composeBtn.disabled = false;
+            }
+        })
+        .catch((error) => {
+            stopComposePolling();
+            composeStatus.textContent = '状态获取失败';
+            summaryOutput.textContent = JSON.stringify({
+                error: error.message,
+                jobId
+            }, null, 2);
+            composeBtn.textContent = '确认大纲并开始编写';
+            composeBtn.disabled = false;
+        });
 }
 
 function renderComposeStatus(payload) {
@@ -375,16 +420,20 @@ function renderComposeStatus(payload) {
     } else if (state === 'completed') {
         setComposeStep('done', '编写完成，可下载 Word 方案');
     } else if (state === 'failed') {
-        composeStatus.textContent = '编写失败';
+        composeStatus.textContent = payload.message || '编写失败';
     }
+    updateProgressMeter(payload);
 
     const lines = [
         `状态：${payload.message || state}`,
         `进度：${payload.progress || 0}%`,
         `写作引擎：${payload.engine || 'unknown'}`,
+        `当前模型：${payload.model || 'unknown'}`,
         payload.warning ? `提示：${payload.warning}` : '',
         payload.currentSection ? `当前章节：${payload.currentSection}` : '',
         payload.currentSubtitle ? `当前小节：${payload.currentSubtitle}` : '',
+        payload.modelElapsedSeconds ? `模型调用耗时：${payload.modelElapsedSeconds} 秒` : '',
+        payload.heartbeatAt ? `最近心跳：${payload.heartbeatAt}` : '',
         payload.pageAllocations ? `\n篇幅分配：\n${(payload.pageAllocations || []).map((item) => `${item.title}：${item.pages}页（${item.source === 'manual' ? '手动' : '自动'}）`).join('\n')}` : '',
         payload.finalDocxUrl ? `\nWord 下载：${payload.finalDocxUrl}` : '',
         `\n原始状态：\n${JSON.stringify(payload, null, 2)}`
@@ -411,7 +460,46 @@ resetBtn.addEventListener('click', () => {
     fileInputs.forEach((id) => updateFileLabel(document.getElementById(id)));
     renderResultLinks({});
     setComposeReady(null);
+    rememberCurrentJob(null);
     resetComposeProgress();
     renderOutline([]);
     summaryOutput.textContent = '等待上传文件...';
 });
+
+function restoreCurrentJob() {
+    const storedJobId = window.localStorage.getItem(currentJobStorageKey);
+    const latestUrl = storedJobId
+        ? `/api/proposals/${storedJobId}`
+        : '/api/proposals/latest';
+
+    fetch(latestUrl)
+        .then((response) => response.json().then((payload) => ({ ok: response.ok, payload })))
+        .then(({ ok, payload }) => {
+            if (!ok) {
+                throw new Error(payload.error || '暂无可恢复任务');
+            }
+
+            const jobId = payload.jobId || storedJobId;
+            setComposeReady(jobId);
+            composeBtn.textContent = '确认大纲并开始编写';
+            const composeStatusPayload = payload.composeStatus || payload;
+            renderResultLinks(payload.composeStatus ? payload : composeStatusPayload);
+            if (payload.outline) {
+                renderOutline(payload.outline);
+            }
+            renderComposeStatus(composeStatusPayload);
+
+            if (['queued', 'running'].includes(composeStatusPayload.state)) {
+                composeBtn.disabled = true;
+                composeBtn.textContent = '后台编写中...';
+                startComposePolling(jobId);
+            }
+
+            summaryOutput.textContent = JSON.stringify(payload, null, 2);
+        })
+        .catch(() => {
+            resetComposeProgress();
+        });
+}
+
+restoreCurrentJob();

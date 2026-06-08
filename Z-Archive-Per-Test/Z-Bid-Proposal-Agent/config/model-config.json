@@ -1,0 +1,31 @@
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "",
+    "ANTHROPIC_BASE_URL": "",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "",
+    "ANTHROPIC_MODEL": "",
+    "ANTHROPIC_REASONING_MODEL": ""
+  },
+  "writer": {
+    "providerPriority": ["anthropic", "codex", "openai", "local"]
+  },
+  "codex": {
+    "enabled": true,
+    "useCurrentLogin": true,
+    "model": "",
+    "timeoutSeconds": 240
+  },
+  "openai": {
+    "enabled": true,
+    "baseUrl": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini",
+    "apiKeyEnv": "OPENAI_API_KEY",
+    "apiKey": ""
+  },
+  "local": {
+    "enabled": true
+  },
+  "includeCoAuthoredBy": false
+}
