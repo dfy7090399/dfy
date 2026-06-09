@@ -12,6 +12,7 @@
             <div class="brand-mark">BPA</div>
             <nav class="top-nav" aria-label="页面导航">
                 <a href="#inputs">材料输入</a>
+                <a href="#model-config">模型认证</a>
                 <a href="#settings">生成设置</a>
                 <a href="#post-processing">后处理</a>
                 <a href="#summary">摘要</a>
@@ -100,9 +101,83 @@
                     </div>
                 </section>
 
+                <section id="model-config" class="panel-section model-config-panel" aria-label="模型认证">
+                    <div class="section-title">
+                        <p class="section-kicker">03 / MODEL</p>
+                        <h2>模型认证</h2>
+                    </div>
+
+                    <div class="model-grid">
+                        <label>
+                            <span>优先使用</span>
+                            <select id="modelProvider" name="modelProvider">
+                                <option value="anthropic">Anthropic-compatible API</option>
+                                <option value="openai">OpenAI-compatible API</option>
+                                <option value="codex">Codex 当前登录态</option>
+                            </select>
+                        </label>
+                        <label>
+                            <span>当前模型状态</span>
+                            <input id="modelStatus" type="text" readonly value="等待加载配置">
+                        </label>
+                    </div>
+
+                    <div class="model-tabs">
+                        <div class="model-card">
+                            <strong>Anthropic-compatible</strong>
+                            <label>
+                                <span>API Key</span>
+                                <input id="anthropicApiKey" type="password" autocomplete="off" placeholder="ANTHROPIC_AUTH_TOKEN">
+                            </label>
+                            <label>
+                                <span>请求地址</span>
+                                <input id="anthropicBaseUrl" type="text" placeholder="https://example.com/api/anthropic/v1">
+                            </label>
+                            <label>
+                                <span>模型名称</span>
+                                <input id="anthropicModel" type="text" placeholder="例如：lite/deepseek-v4-flash">
+                            </label>
+                        </div>
+
+                        <div class="model-card">
+                            <strong>OpenAI-compatible</strong>
+                            <label>
+                                <span>API Key</span>
+                                <input id="openaiApiKey" type="password" autocomplete="off" placeholder="OPENAI_API_KEY">
+                            </label>
+                            <label>
+                                <span>请求地址</span>
+                                <input id="openaiBaseUrl" type="text" placeholder="https://api.openai.com/v1">
+                            </label>
+                            <label>
+                                <span>模型名称</span>
+                                <input id="openaiModel" type="text" placeholder="例如：gpt-4o-mini">
+                            </label>
+                        </div>
+
+                        <div class="model-card">
+                            <strong>Codex CLI</strong>
+                            <label>
+                                <span>指定模型</span>
+                                <input id="codexModel" type="text" placeholder="留空则使用当前 Codex 登录态默认模型">
+                            </label>
+                            <label>
+                                <span>调用超时（秒）</span>
+                                <input id="codexTimeoutSeconds" type="number" min="30" max="900" value="240">
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="model-actions">
+                        <button type="button" id="saveModelConfigBtn" class="secondary">保存模型配置</button>
+                        <button type="button" id="testModelConfigBtn" class="secondary">验证模型</button>
+                        <span id="modelConfigMessage">配置会保存到本地文件，不提交到仓库。</span>
+                    </div>
+                </section>
+
                 <section id="post-processing" class="panel-section heading-settings" aria-label="标题调整">
                     <div class="section-title">
-                        <p class="section-kicker">03 / HEADING</p>
+                        <p class="section-kicker">04 / HEADING</p>
                         <h2>标题调整</h2>
                     </div>
 
@@ -175,7 +250,7 @@
 
                 <section class="panel-section page-plan-settings" aria-label="篇幅规划">
                     <div class="section-title">
-                        <p class="section-kicker">04 / LENGTH</p>
+                        <p class="section-kicker">05 / LENGTH</p>
                         <h2>篇幅规划</h2>
                     </div>
 
@@ -239,8 +314,8 @@
             </form>
 
             <section id="summary" class="preview-panel" aria-live="polite">
-                <p class="section-kicker">05 / JSON PREVIEW</p>
-                <h2>生成结果</h2>
+                <p class="section-kicker">06 / STATUS</p>
+                <h2>任务状态</h2>
                 <div id="resultLinks" class="result-links" hidden></div>
                 <section class="outline-panel">
                     <div class="outline-header">
@@ -271,7 +346,7 @@
                     </div>
                     <div class="progress-live" id="composeLiveDetail">等待确认大纲。</div>
                 </section>
-                <pre id="summaryOutput">等待上传文件...</pre>
+                <div id="summaryOutput" class="status-summary">等待上传文件...</div>
             </section>
         </section>
     </main>

@@ -118,6 +118,16 @@ class ProposalHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if self.path == "/api/model-config":
+                response = self.handle_model_config_save()
+                self.send_json(response, HTTPStatus.OK)
+                return
+
+            if self.path == "/api/model-config/test":
+                response = self.handle_model_config_test()
+                self.send_json(response, HTTPStatus.OK)
+                return
+
             if self.path == "/api/proposals":
                 response = self.handle_proposal_request()
                 self.send_json(response, HTTPStatus.CREATED)
@@ -139,6 +149,10 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             return
 
     def do_GET(self):
+        if self.path == "/api/model-config":
+            self.send_json(self.handle_model_config_read(), HTTPStatus.OK)
+            return
+
         if self.path == "/api/proposals/latest":
             try:
                 self.send_json(self.handle_latest_proposal(), HTTPStatus.OK)
@@ -174,6 +188,96 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             return
 
         super().do_HEAD()
+
+    def handle_model_config_read(self):
+        config = load_model_config()
+        return {
+            "config": self.mask_model_config(config),
+            "activeProvider": self.active_writer_provider(),
+            "engine": self.writer_engine_name(),
+            "model": self.writer_model_name(),
+            "localConfigExists": MODEL_CONFIG_LOCAL_FILE.exists(),
+        }
+
+    def handle_model_config_save(self):
+        payload = self.parse_json_body()
+        provider = payload.get("provider", "anthropic")
+        current = load_model_config()
+        current_env = current.get("env", {})
+        current_openai = current.get("openai", {})
+        anthropic_key = payload.get("anthropicApiKey", "")
+        openai_key = payload.get("openaiApiKey", "")
+        if not anthropic_key or anthropic_key == "********":
+            anthropic_key = current_env.get("ANTHROPIC_AUTH_TOKEN", "")
+        if not openai_key or openai_key == "********":
+            openai_key = current_openai.get("apiKey", "")
+        config = {
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": anthropic_key,
+                "ANTHROPIC_BASE_URL": payload.get("anthropicBaseUrl", ""),
+                "ANTHROPIC_MODEL": payload.get("anthropicModel", ""),
+            },
+            "writer": {
+                "providerPriority": payload.get("providerPriority") or self.provider_priority_for(provider),
+            },
+            "codex": {
+                "enabled": bool(payload.get("codexEnabled", True)),
+                "model": payload.get("codexModel", ""),
+                "timeoutSeconds": int(payload.get("codexTimeoutSeconds") or 240),
+            },
+            "openai": {
+                "enabled": bool(payload.get("openaiEnabled", True)),
+                "baseUrl": payload.get("openaiBaseUrl", "https://api.openai.com/v1"),
+                "model": payload.get("openaiModel", "gpt-4o-mini"),
+                "apiKeyEnv": payload.get("openaiApiKeyEnv", "OPENAI_API_KEY"),
+                "apiKey": openai_key,
+            },
+        }
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        MODEL_CONFIG_LOCAL_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {
+            "message": "模型配置已保存到本地配置文件",
+            "config": self.mask_model_config(load_model_config()),
+            "activeProvider": self.active_writer_provider(),
+            "engine": self.writer_engine_name(),
+            "model": self.writer_model_name(),
+        }
+
+    def handle_model_config_test(self):
+        text = self.call_configured_llm("请只输出：模型配置验证通过")
+        if not text:
+            raise ValueError("模型调用失败，请检查 API Key、请求地址和模型名称")
+        return {
+            "message": "模型配置验证通过",
+            "engine": self.writer_engine_name(),
+            "model": self.writer_model_name(),
+            "outputPreview": text[:120],
+        }
+
+    def provider_priority_for(self, provider):
+        mapping = {
+            "anthropic": ["anthropic", "codex", "openai", "local"],
+            "openai": ["openai", "anthropic", "codex", "local"],
+            "codex": ["codex", "anthropic", "openai", "local"],
+        }
+        return mapping.get(provider, mapping["anthropic"])
+
+    def mask_model_config(self, config):
+        masked = json.loads(json.dumps(config, ensure_ascii=False))
+        for section in [masked.get("env", {}), masked.get("anthropic", {}), masked.get("openai", {})]:
+            for key in list(section.keys()):
+                key_upper = key.upper()
+                if key in {"apiKeyEnv"}:
+                    continue
+                if any(token in key_upper for token in ["APIKEY", "AUTH_TOKEN", "SECRET"]) and section.get(key):
+                    section[key] = "********"
+        return masked
+
+    def parse_json_body(self):
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length <= 0:
+            return {}
+        return json.loads(self.rfile.read(length).decode("utf-8"))
 
     def handle_latest_proposal(self):
         job_dirs = [
@@ -589,6 +693,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
                     base_progress=child_progress,
                 ):
                     self.add_body_paragraph(document, paragraph)
+                self.add_outline_substructure(document, child, title)
                 child_chars = self.document_text_length(document) - child_start_chars
                 completed_children += 1
                 child_stats.append({
@@ -629,6 +734,48 @@ class ProposalHandler(SimpleHTTPRequestHandler):
         paragraph = document.add_paragraph(text)
         paragraph.paragraph_format.first_line_indent = BODY_FIRST_LINE_INDENT
         return paragraph
+
+    def add_outline_substructure(self, document, node, section_title):
+        children = node.get("children") or []
+        if not children:
+            return
+        for child in children:
+            level = min(max(int(child.get("level", 3)), 3), 4)
+            document.add_heading(child.get("title", "细化内容"), level=level)
+            leaf_titles = [leaf.get("title", "") for leaf in child.get("children", []) if leaf.get("title")]
+            if leaf_titles:
+                self.add_bullet_list(document, leaf_titles)
+                self.add_check_table(document, child.get("title", ""), leaf_titles[:3])
+            else:
+                self.add_body_paragraph(document, f"本部分围绕“{child.get('title', '')}”补充执行动作、输出材料和检查口径。")
+        self.add_callout(document, f"{node.get('title', '本小节')}应与评分条款、交付物清单和验收记录形成对应关系，避免只描述原则而缺少过程支撑。")
+
+    def add_bullet_list(self, document, items):
+        for item in items[:5]:
+            paragraph = document.add_paragraph(style="List Bullet")
+            paragraph.add_run(item)
+
+    def add_callout(self, document, text):
+        table = document.add_table(rows=1, cols=1)
+        table.style = "Table Grid"
+        cell = table.rows[0].cells[0]
+        cell.text = f"关键控制点：{text}"
+        for paragraph in cell.paragraphs:
+            paragraph.paragraph_format.first_line_indent = None
+        document.add_paragraph("")
+
+    def add_check_table(self, document, title, items):
+        table = document.add_table(rows=1, cols=3)
+        table.style = "Table Grid"
+        headers = ["检查项", "输出材料", "确认口径"]
+        for index, header in enumerate(headers):
+            table.rows[0].cells[index].text = header
+        for item in items:
+            cells = table.add_row().cells
+            cells[0].text = item
+            cells[1].text = f"{title}记录"
+            cells[2].text = "客户确认、过程留痕、结果可复核"
+        document.add_paragraph("")
 
     def clear_document(self, document):
         body = document._element.body
@@ -765,10 +912,11 @@ class ProposalHandler(SimpleHTTPRequestHandler):
 
 请直接输出正式方案正文，要求：
 1. 使用中文投标方案文风，不要解释你在做什么。
-2. 输出 6 到 10 个自然段，每段 80 到 180 字。
-3. 必须结合评分项和技术规范书，不要空泛堆词。
+2. 输出 5 到 8 个自然段，每段 70 到 150 字，句式要有长短变化。
+3. 必须结合评分项和技术规范书，至少写清一个执行动作、一个输出材料和一个验收口径。
 4. 不要输出标题、编号、Markdown、项目符号。
-5. 段落之间用换行分隔。
+5. 避免“高度重视、全面保障、持续优化”等空泛堆词，优先写项目场景、责任角色、交付记录和客户确认方式。
+6. 段落之间用换行分隔。
 """
         text = self.call_configured_llm(
             prompt,

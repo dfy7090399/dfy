@@ -50,7 +50,7 @@ class DocumentExporterAgent:
                     "",
                     "### 子标题规划",
                     "",
-                    *[f"- {child['title']}" for child in section.get("children", [])],
+                    *self.render_children(section.get("children", [])),
                     "",
                     "待生成正文：后续内容生成智能体将在此处补充完整段落、表格和应答材料。",
                     "",
@@ -76,3 +76,11 @@ class DocumentExporterAgent:
         )
 
         return "\n".join(lines)
+
+    def render_children(self, children: list[dict], depth: int = 0) -> list[str]:
+        lines = []
+        indent = "  " * depth
+        for child in children:
+            lines.append(f"{indent}- H{child.get('level', depth + 2)} {child.get('title', '')}")
+            lines.extend(self.render_children(child.get("children", []), depth + 1))
+        return lines

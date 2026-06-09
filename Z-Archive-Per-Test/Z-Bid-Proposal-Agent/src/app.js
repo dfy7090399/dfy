@@ -12,12 +12,28 @@ const composeProgressBar = document.getElementById('composeProgressBar');
 const composeProgressPercent = document.getElementById('composeProgressPercent');
 const composeProgressModel = document.getElementById('composeProgressModel');
 const composeLiveDetail = document.getElementById('composeLiveDetail');
+const saveModelConfigBtn = document.getElementById('saveModelConfigBtn');
+const testModelConfigBtn = document.getElementById('testModelConfigBtn');
+const modelConfigMessage = document.getElementById('modelConfigMessage');
+const modelStatus = document.getElementById('modelStatus');
 
 const fileInputs = ['technicalSpecification', 'scoringCriteria', 'templateFile'];
 const defaultTemplatePath = 'templates/default-proposal-template.docx';
 const currentJobStorageKey = 'bidProposalAgent.currentJobId';
 let currentJobId = null;
 let composePollTimer = null;
+
+const modelFields = [
+    'modelProvider',
+    'anthropicApiKey',
+    'anthropicBaseUrl',
+    'anthropicModel',
+    'openaiApiKey',
+    'openaiBaseUrl',
+    'openaiModel',
+    'codexModel',
+    'codexTimeoutSeconds'
+];
 
 function formatFile(file) {
     if (!file) {
@@ -79,6 +95,95 @@ function buildFormData(summary) {
     return formData;
 }
 
+function collectModelConfig() {
+    return {
+        provider: document.getElementById('modelProvider').value,
+        anthropicApiKey: document.getElementById('anthropicApiKey').value.trim(),
+        anthropicBaseUrl: document.getElementById('anthropicBaseUrl').value.trim(),
+        anthropicModel: document.getElementById('anthropicModel').value.trim(),
+        openaiApiKey: document.getElementById('openaiApiKey').value.trim(),
+        openaiBaseUrl: document.getElementById('openaiBaseUrl').value.trim(),
+        openaiModel: document.getElementById('openaiModel').value.trim(),
+        codexModel: document.getElementById('codexModel').value.trim(),
+        codexTimeoutSeconds: Number(document.getElementById('codexTimeoutSeconds').value || 240)
+    };
+}
+
+function populateModelConfig(payload) {
+    const config = payload.config || {};
+    const env = config.env || {};
+    const openai = config.openai || {};
+    const codex = config.codex || {};
+    const provider = payload.activeProvider || (config.writer?.providerPriority || [])[0] || 'anthropic';
+    document.getElementById('modelProvider').value = ['anthropic', 'openai', 'codex'].includes(provider) ? provider : 'anthropic';
+    document.getElementById('anthropicApiKey').value = env.ANTHROPIC_AUTH_TOKEN || '';
+    document.getElementById('anthropicBaseUrl').value = env.ANTHROPIC_BASE_URL || config.anthropic?.baseUrl || '';
+    document.getElementById('anthropicModel').value = env.ANTHROPIC_MODEL || config.anthropic?.model || '';
+    document.getElementById('openaiApiKey').value = openai.apiKey || '';
+    document.getElementById('openaiBaseUrl').value = openai.baseUrl || 'https://api.openai.com/v1';
+    document.getElementById('openaiModel').value = openai.model || 'gpt-4o-mini';
+    document.getElementById('codexModel').value = codex.model || '';
+    document.getElementById('codexTimeoutSeconds').value = codex.timeoutSeconds || 240;
+    updateModelStatus(payload);
+}
+
+function updateModelStatus(payload) {
+    const engine = payload.engine || payload.activeProvider || '未配置';
+    const model = payload.model || '未选择模型';
+    modelStatus.value = `${engine} / ${model}`;
+}
+
+function loadModelConfig() {
+    fetch('/api/model-config')
+        .then((response) => response.json().then((payload) => ({ ok: response.ok, payload })))
+        .then(({ ok, payload }) => {
+            if (!ok) {
+                throw new Error(payload.error || '模型配置读取失败');
+            }
+            populateModelConfig(payload);
+            modelConfigMessage.textContent = payload.localConfigExists ? '已加载本地模型配置。' : '使用默认模型配置。';
+        })
+        .catch((error) => {
+            modelConfigMessage.textContent = `模型配置读取失败：${error.message}`;
+        });
+}
+
+function saveModelConfig() {
+    modelConfigMessage.textContent = '正在保存模型配置...';
+    fetch('/api/model-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(collectModelConfig())
+    })
+        .then((response) => response.json().then((payload) => ({ ok: response.ok, payload })))
+        .then(({ ok, payload }) => {
+            if (!ok) {
+                throw new Error(payload.error || '模型配置保存失败');
+            }
+            populateModelConfig(payload);
+            modelConfigMessage.textContent = '模型配置已保存。';
+        })
+        .catch((error) => {
+            modelConfigMessage.textContent = `保存失败：${error.message}`;
+        });
+}
+
+function testModelConfig() {
+    modelConfigMessage.textContent = '正在验证模型...';
+    fetch('/api/model-config/test', { method: 'POST' })
+        .then((response) => response.json().then((payload) => ({ ok: response.ok, payload })))
+        .then(({ ok, payload }) => {
+            if (!ok) {
+                throw new Error(payload.error || '模型验证失败');
+            }
+            updateModelStatus(payload);
+            modelConfigMessage.textContent = `${payload.message}：${payload.outputPreview || ''}`;
+        })
+        .catch((error) => {
+            modelConfigMessage.textContent = `验证失败：${error.message}`;
+        });
+}
+
 function renderResultLinks(payload) {
     if (!payload.manifestUrl) {
         resultLinks.hidden = true;
@@ -94,6 +199,38 @@ function renderResultLinks(payload) {
         ${payload.finalDocxUrl ? `<a class="download-link" href="${payload.finalDocxUrl}" download>下载 Word 方案</a>` : ''}
         ${payload.pipelineUrl ? `<a href="${payload.pipelineUrl}" target="_blank" rel="noreferrer">查看智能体流水线</a>` : ''}
     `;
+}
+
+function renderStatusSummary(title, items = [], rawPayload = null) {
+    const itemMarkup = items
+        .filter((item) => item.value !== undefined && item.value !== null && item.value !== '')
+        .map((item) => `
+            <div class="status-row">
+                <span>${escapeHtml(item.label)}</span>
+                <strong>${escapeHtml(item.value)}</strong>
+            </div>
+        `)
+        .join('');
+    const rawMarkup = rawPayload
+        ? `
+            <details class="raw-detail">
+                <summary>查看原始数据</summary>
+                <pre>${escapeHtml(JSON.stringify(rawPayload, null, 2))}</pre>
+            </details>
+        `
+        : '';
+
+    summaryOutput.innerHTML = `
+        <div class="status-card">
+            <h3>${escapeHtml(title)}</h3>
+            <div class="status-rows">${itemMarkup || '<p class="status-muted">暂无状态信息</p>'}</div>
+            ${rawMarkup}
+        </div>
+    `;
+}
+
+function renderPlainStatus(message) {
+    renderStatusSummary(message, []);
 }
 
 function rememberCurrentJob(jobId) {
@@ -210,10 +347,22 @@ function renderChildren(children) {
     return `
         <div class="outline-children">
             <strong>子标题规划</strong>
-            <ol>
-                ${children.slice(0, 7).map((child) => `<li>${escapeHtml(child.title)}</li>`).join('')}
-            </ol>
+            ${renderOutlineTree(children)}
         </div>
+    `;
+}
+
+function renderOutlineTree(nodes = []) {
+    return `
+        <ol>
+            ${nodes.map((node) => `
+                <li>
+                    <span class="outline-node-level">H${node.level || 2}</span>
+                    ${escapeHtml(node.title)}
+                    ${node.children?.length ? renderOutlineTree(node.children) : ''}
+                </li>
+            `).join('')}
+        </ol>
     `;
 }
 
@@ -289,6 +438,18 @@ fileInputs.forEach((id) => {
     input.addEventListener('change', () => updateFileLabel(input));
 });
 
+modelFields.forEach((id) => {
+    const input = document.getElementById(id);
+    if (input) {
+        input.addEventListener('change', () => {
+            modelConfigMessage.textContent = '模型配置已修改，保存后生效。';
+        });
+    }
+});
+
+saveModelConfigBtn.addEventListener('click', saveModelConfig);
+testModelConfigBtn.addEventListener('click', testModelConfig);
+
 form.addEventListener('submit', (event) => {
     event.preventDefault();
 
@@ -301,7 +462,7 @@ form.addEventListener('submit', (event) => {
     resetComposeProgress();
     renderOutline([]);
     outlineStatus.textContent = '生成中...';
-    summaryOutput.textContent = '正在提交生成任务...';
+    renderPlainStatus('正在提交生成任务...');
 
     fetch('/api/proposals', {
         method: 'POST',
@@ -317,17 +478,23 @@ form.addEventListener('submit', (event) => {
             renderOutline(payload.outline || []);
             setComposeReady(payload.jobId);
             rememberCurrentJob(payload.jobId);
-            summaryOutput.textContent = JSON.stringify(payload, null, 2);
+            renderStatusSummary('大纲已生成', [
+                { label: '任务编号', value: payload.jobId },
+                { label: '章节数量', value: `${(payload.outline || []).length} 个` },
+                { label: '模板来源', value: payload.templateSource || payload.manifest?.templateSource },
+            ], payload);
         })
         .catch((error) => {
             renderResultLinks({});
             setComposeReady(null);
             renderOutline([]);
-            summaryOutput.textContent = JSON.stringify({
+            renderStatusSummary('生成失败', [
+                { label: '错误信息', value: error.message },
+            ], {
                 mode: 'local-preview',
                 warning: `未连接后端，仅显示本地摘要：${error.message}`,
                 summary
-            }, null, 2);
+            });
         });
 });
 
@@ -339,7 +506,7 @@ composeBtn.addEventListener('click', () => {
     composeBtn.disabled = true;
     composeBtn.textContent = '后台编写中...';
     setComposeStep('confirm', '已确认大纲');
-    summaryOutput.textContent = '已确认大纲，正在启动后台智能体写作任务...';
+    renderPlainStatus('已确认大纲，正在启动后台智能体写作任务...');
 
     window.setTimeout(() => {
         setComposeStep('compose', '正在启动后台写作任务');
@@ -361,10 +528,13 @@ composeBtn.addEventListener('click', () => {
         .catch((error) => {
             composeBtn.disabled = false;
             composeStatus.textContent = '编写失败';
-            summaryOutput.textContent = JSON.stringify({
+            renderStatusSummary('编写启动失败', [
+                { label: '错误信息', value: error.message },
+                { label: '任务编号', value: currentJobId },
+            ], {
                 error: error.message,
                 jobId: currentJobId
-            }, null, 2);
+            });
         })
 });
 
@@ -402,10 +572,13 @@ function fetchComposeStatus(jobId) {
         .catch((error) => {
             stopComposePolling();
             composeStatus.textContent = '状态获取失败';
-            summaryOutput.textContent = JSON.stringify({
+            renderStatusSummary('状态获取失败', [
+                { label: '错误信息', value: error.message },
+                { label: '任务编号', value: jobId },
+            ], {
                 error: error.message,
                 jobId
-            }, null, 2);
+            });
             composeBtn.textContent = '确认大纲并开始编写';
             composeBtn.disabled = false;
         });
@@ -424,34 +597,17 @@ function renderComposeStatus(payload) {
     }
     updateProgressMeter(payload);
 
-    const lines = [
-        `状态：${payload.message || state}`,
-        `进度：${payload.progress || 0}%`,
-        `写作引擎：${payload.engine || 'unknown'}`,
-        `当前模型：${payload.model || 'unknown'}`,
-        payload.warning ? `提示：${payload.warning}` : '',
-        payload.currentSection ? `当前章节：${payload.currentSection}` : '',
-        payload.currentSubtitle ? `当前小节：${payload.currentSubtitle}` : '',
-        payload.modelElapsedSeconds ? `模型调用耗时：${payload.modelElapsedSeconds} 秒` : '',
-        payload.heartbeatAt ? `最近心跳：${payload.heartbeatAt}` : '',
-        payload.pageAllocations ? `\n篇幅分配：\n${(payload.pageAllocations || []).map((item) => `${item.title}：${item.pages}页（${item.source === 'manual' ? '手动' : '自动'}）`).join('\n')}` : '',
-        payload.finalDocxUrl ? `\nWord 下载：${payload.finalDocxUrl}` : '',
-        `\n原始状态：\n${JSON.stringify(payload, null, 2)}`
-    ].filter(Boolean);
-
-    summaryOutput.textContent = lines.join('\n');
-}
-
-function renderPageAllocations(pageAllocations, payload) {
-    if (!pageAllocations.length) {
-        return JSON.stringify(payload, null, 2);
-    }
-
-    const allocationSummary = pageAllocations
-        .map((item) => `${item.title}：${item.pages}页（${item.source === 'manual' ? '手动' : '自动'}）`)
-        .join('\n');
-
-    return `正式编写已完成，Word 文件已生成。\n\n篇幅分配：\n${allocationSummary}\n\n原始响应：\n${JSON.stringify(payload, null, 2)}`;
+    renderStatusSummary('编写状态', [
+        { label: '状态', value: payload.message || state },
+        { label: '进度', value: `${payload.progress || 0}%` },
+        { label: '写作引擎', value: payload.engine || 'unknown' },
+        { label: '当前模型', value: payload.model || 'unknown' },
+        { label: '当前章节', value: payload.currentSection },
+        { label: '当前小节', value: payload.currentSubtitle },
+        { label: '模型耗时', value: payload.modelElapsedSeconds ? `${payload.modelElapsedSeconds} 秒` : '' },
+        { label: 'Word 下载', value: payload.finalDocxUrl },
+        { label: '提示', value: payload.warning },
+    ], payload);
 }
 
 resetBtn.addEventListener('click', () => {
@@ -463,7 +619,7 @@ resetBtn.addEventListener('click', () => {
     rememberCurrentJob(null);
     resetComposeProgress();
     renderOutline([]);
-    summaryOutput.textContent = '等待上传文件...';
+    renderPlainStatus('等待上传文件...');
 });
 
 function restoreCurrentJob() {
@@ -495,7 +651,12 @@ function restoreCurrentJob() {
                 startComposePolling(jobId);
             }
 
-            summaryOutput.textContent = JSON.stringify(payload, null, 2);
+            renderStatusSummary('已恢复最近任务', [
+                { label: '任务编号', value: jobId },
+                { label: '状态', value: composeStatusPayload.message || composeStatusPayload.state },
+                { label: '章节数量', value: payload.outline ? `${payload.outline.length} 个` : '' },
+                { label: '当前模型', value: composeStatusPayload.model },
+            ], payload);
         })
         .catch(() => {
             resetComposeProgress();
@@ -503,3 +664,4 @@ function restoreCurrentJob() {
 }
 
 restoreCurrentJob();
+loadModelConfig();

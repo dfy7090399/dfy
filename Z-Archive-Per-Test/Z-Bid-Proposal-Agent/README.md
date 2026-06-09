@@ -24,6 +24,19 @@ Bid Proposal Agent 用于辅助安全售前/FDE 在投标、POC、方案交付�
 - 章节页数：用户可根据生成的大纲，按章节名称指定目标页数。
 - 分配策略：手动指定章节页数优先，未指定章节由生成器结合剩余页数自动分配。
 
+支持 Web 页面配置大模型认证：
+
+- Anthropic-compatible API：填写 API Key、请求地址和模型名称。
+- OpenAI-compatible API：填写 API Key、请求地址和模型名称。
+- Codex CLI：默认使用当前登录态，也可填写指定模型。
+- 配置保存到本地 `config/model-config.local.json`，不会提交到仓库。
+
+支持更丰富的大纲与正文输出：
+
+- 大纲可生成二级、三级、四级标题结构。
+- Word 正文不再只堆叠长段落，会结合小标题、要点清单、检查表、关键控制点等形式组织内容。
+- 正文段落保持首行缩进两个中文字符，标题和表格保持独立样式。
+
 ## 运行
 
 启动本地后端服务：
@@ -54,7 +67,7 @@ open src/index.html
 config/model-config.json
 ```
 
-系统会在每次模型调用前重新读取模型配置，因此用户修改 `model-config` 后，下一次章节编写会自动使用最新配置。
+系统会在每次模型调用前重新读取模型配置，因此用户在 Web 页面或本地文件修改 `model-config` 后，下一次章节编写会自动使用最新配置。
 
 默认策略是优先使用配置文件中的模型信息；如果配置了 `env.ANTHROPIC_*`，会优先调用 Anthropic-compatible Messages API。未配置专用 API 时，使用本机 `Codex CLI` 当前登录态和当前默认模型，也就是跟随用户在 Codex 中已经填写/登录的模型信息。
 
