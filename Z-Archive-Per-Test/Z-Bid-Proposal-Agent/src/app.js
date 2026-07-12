@@ -16,12 +16,20 @@ const saveModelConfigBtn = document.getElementById('saveModelConfigBtn');
 const testModelConfigBtn = document.getElementById('testModelConfigBtn');
 const modelConfigMessage = document.getElementById('modelConfigMessage');
 const modelStatus = document.getElementById('modelStatus');
+const openOutlineChatBtn = document.getElementById('openOutlineChatBtn');
+const outlineChatDialog = document.getElementById('outlineChatDialog');
+const outlineChatMessages = document.getElementById('outlineChatMessages');
+const outlineChatInput = document.getElementById('outlineChatInput');
+const sendOutlineChatBtn = document.getElementById('sendOutlineChatBtn');
+const closeOutlineChatBtn = document.getElementById('closeOutlineChatBtn');
+const cancelOutlineChatBtn = document.getElementById('cancelOutlineChatBtn');
 
 const fileInputs = ['technicalSpecification', 'scoringCriteria', 'templateFile'];
 const defaultTemplatePath = 'templates/default-proposal-template.docx';
 const currentJobStorageKey = 'bidProposalAgent.currentJobId';
 let currentJobId = null;
 let composePollTimer = null;
+let outlineChatHistory = [];
 
 const modelFields = [
     'modelProvider',
@@ -245,6 +253,9 @@ function setComposeReady(jobId) {
     currentJobId = jobId || null;
     rememberCurrentJob(currentJobId);
     composeBtn.disabled = !currentJobId;
+    if (openOutlineChatBtn) {
+        openOutlineChatBtn.disabled = !currentJobId;
+    }
     if (currentJobId) {
         resetComposeProgress('大纲已生成，等待确认');
         composeProgress.hidden = false;
@@ -311,10 +322,16 @@ function renderOutline(outline = []) {
         outlineStatus.textContent = '等待生成';
         outlineOutput.className = 'outline-output empty';
         outlineOutput.textContent = '上传材料并生成后，会在这里展示可确认的大纲。';
+        if (openOutlineChatBtn) {
+            openOutlineChatBtn.disabled = true;
+        }
         return;
     }
 
     outlineStatus.textContent = `${outline.length} 个章节`;
+    if (openOutlineChatBtn) {
+        openOutlineChatBtn.disabled = !currentJobId;
+    }
     outlineOutput.className = 'outline-output';
     outlineOutput.innerHTML = outline.map((section, index) => {
         const scoringItems = section.relatedScoringItems || [];
@@ -373,6 +390,87 @@ function escapeHtml(value) {
         .replaceAll('>', '&gt;')
         .replaceAll('"', '&quot;')
         .replaceAll("'", '&#039;');
+}
+
+function appendOutlineChatMessage(role, text) {
+    if (!outlineChatMessages) {
+        return;
+    }
+
+    outlineChatHistory.push({ role, message: text });
+    const messageNode = document.createElement('div');
+    messageNode.className = `chat-message ${role === 'user' ? 'user' : 'assistant'}`;
+    messageNode.textContent = text;
+    outlineChatMessages.appendChild(messageNode);
+    outlineChatMessages.scrollTop = outlineChatMessages.scrollHeight;
+}
+
+function openOutlineChat() {
+    if (!currentJobId || !outlineChatDialog) {
+        return;
+    }
+
+    if (!outlineChatMessages.children.length) {
+        appendOutlineChatMessage('assistant', '可以直接描述你希望调整的大纲方向，例如删减章节、增加层级、强化交付物或验收口径。');
+    }
+    outlineChatDialog.showModal();
+    outlineChatInput?.focus();
+}
+
+function closeOutlineChat() {
+    outlineChatDialog?.close();
+}
+
+function sendOutlineChat() {
+    if (!currentJobId || !outlineChatInput) {
+        return;
+    }
+
+    const message = outlineChatInput.value.trim();
+    if (!message) {
+        outlineChatInput.focus();
+        return;
+    }
+
+    appendOutlineChatMessage('user', message);
+    outlineChatInput.value = '';
+    sendOutlineChatBtn.disabled = true;
+    sendOutlineChatBtn.textContent = '调整中...';
+
+    fetch(`/api/proposals/${currentJobId}/outline/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            message,
+            history: outlineChatHistory.slice(-8)
+        })
+    })
+        .then((response) => response.json().then((payload) => ({ ok: response.ok, payload })))
+        .then(({ ok, payload }) => {
+            if (!ok) {
+                throw new Error(payload.error || '大纲调整失败');
+            }
+
+            renderOutline(payload.outline || []);
+            setComposeReady(payload.jobId);
+            appendOutlineChatMessage('assistant', payload.message || '大纲已调整。');
+            renderStatusSummary('大纲已调整', [
+                { label: '任务编号', value: payload.jobId },
+                { label: '章节数量', value: `${(payload.outline || []).length} 个` },
+                { label: '调整模型', value: payload.model },
+            ], payload);
+        })
+        .catch((error) => {
+            appendOutlineChatMessage('assistant', `调整失败：${error.message}`);
+            renderStatusSummary('大纲调整失败', [
+                { label: '错误信息', value: error.message },
+                { label: '任务编号', value: currentJobId },
+            ]);
+        })
+        .finally(() => {
+            sendOutlineChatBtn.disabled = false;
+            sendOutlineChatBtn.textContent = '提交调整';
+        });
 }
 
 function collectHeadingRules() {
@@ -458,6 +556,10 @@ form.addEventListener('submit', (event) => {
     }
 
     const summary = collectSummary();
+    outlineChatHistory = [];
+    if (outlineChatMessages) {
+        outlineChatMessages.innerHTML = '';
+    }
     setComposeReady(null);
     resetComposeProgress();
     renderOutline([]);
@@ -613,6 +715,10 @@ function renderComposeStatus(payload) {
 resetBtn.addEventListener('click', () => {
     stopComposePolling();
     form.reset();
+    outlineChatHistory = [];
+    if (outlineChatMessages) {
+        outlineChatMessages.innerHTML = '';
+    }
     fileInputs.forEach((id) => updateFileLabel(document.getElementById(id)));
     renderResultLinks({});
     setComposeReady(null);
@@ -620,6 +726,16 @@ resetBtn.addEventListener('click', () => {
     resetComposeProgress();
     renderOutline([]);
     renderPlainStatus('等待上传文件...');
+});
+
+openOutlineChatBtn?.addEventListener('click', openOutlineChat);
+closeOutlineChatBtn?.addEventListener('click', closeOutlineChat);
+cancelOutlineChatBtn?.addEventListener('click', closeOutlineChat);
+sendOutlineChatBtn?.addEventListener('click', sendOutlineChat);
+outlineChatInput?.addEventListener('keydown', (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+        sendOutlineChat();
+    }
 });
 
 function restoreCurrentJob() {

@@ -133,6 +133,12 @@ class ProposalHandler(SimpleHTTPRequestHandler):
                 self.send_json(response, HTTPStatus.CREATED)
                 return
 
+            if self.path.startswith("/api/proposals/") and self.path.endswith("/outline/chat"):
+                job_id = self.path.removeprefix("/api/proposals/").removesuffix("/outline/chat").strip("/")
+                response = self.handle_outline_chat(job_id)
+                self.send_json(response, HTTPStatus.OK)
+                return
+
             if self.path.startswith("/api/proposals/") and self.path.endswith("/compose"):
                 job_id = self.path.removeprefix("/api/proposals/").removesuffix("/compose").strip("/")
                 response = self.handle_compose_request(job_id)
@@ -321,6 +327,278 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             "jobId": job_dir.name,
             **self.build_proposal_detail(job_dir, manifest, pipeline_result),
         }
+
+    def handle_outline_chat(self, job_id):
+        job_dir = (OUTPUT_DIR / safe_job_id(job_id)).resolve()
+        if not str(job_dir).startswith(str(OUTPUT_DIR.resolve())) or not job_dir.is_dir():
+            raise ValueError("任务不存在")
+
+        payload = self.parse_json_body()
+        message = self.clean_text(payload.get("message", ""))
+        if not message:
+            raise ValueError("请输入大纲调整要求")
+
+        status = self.read_compose_status(job_dir)
+        with ACTIVE_COMPOSE_LOCK:
+            compose_is_active = job_id in ACTIVE_COMPOSE_TASKS
+        if compose_is_active and status.get("state") in {"queued", "running"}:
+            raise ValueError("当前正在正式编写，请等待完成后再调整大纲")
+
+        pipeline_path = job_dir / "pipeline-result.json"
+        if not pipeline_path.exists():
+            raise ValueError("任务缺少大纲结果，请先生成大纲")
+
+        pipeline_result = json.loads(pipeline_path.read_text(encoding="utf-8"))
+        outline = pipeline_result.get("outline", {}).get("sections", [])
+        adjusted_outline = (
+            self.adjust_outline_by_hard_rules(outline, message)
+            or self.adjust_outline_with_llm(outline, message)
+            or self.adjust_outline_locally(outline, message)
+        )
+        if not adjusted_outline:
+            raise ValueError("大纲调整失败，请换一种更明确的表达")
+        adjusted_outline = self.diversify_outline_titles(adjusted_outline)
+
+        pipeline_result.setdefault("outline", {})["sections"] = adjusted_outline
+        pipeline_result.setdefault("outline", {})["lastAdjustment"] = {
+            "message": message,
+            "updatedAt": datetime.now(timezone.utc).isoformat(),
+            "engine": self.writer_engine_name(),
+            "model": self.writer_model_name(),
+        }
+        pipeline_result.setdefault("outline", {}).setdefault("chatHistory", []).append({
+            "role": "user",
+            "message": message,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+        })
+        pipeline_result.setdefault("outline", {}).setdefault("chatHistory", []).append({
+            "role": "assistant",
+            "message": f"已调整为 {len(adjusted_outline)} 个一级章节，并刷新子标题层级。",
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+        })
+        pipeline_path.write_text(json.dumps(pipeline_result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        return {
+            "message": "大纲已根据对话要求调整",
+            "jobId": job_id,
+            "outline": adjusted_outline,
+            "pipelineUrl": f"/output/{job_id}/pipeline-result.json",
+            "engine": self.writer_engine_name(),
+            "model": self.writer_model_name(),
+        }
+
+    def adjust_outline_by_hard_rules(self, outline, message):
+        if not self.is_two_section_outline_request(message):
+            return []
+
+        scoring_items = []
+        for section in outline:
+            scoring_items.extend(section.get("relatedScoringItems") or [])
+        scoring_items = scoring_items[:12]
+
+        return [
+            {
+                "level": 1,
+                "title": "技术方案",
+                "writingGoal": "围绕技术路线、能力响应、实施交付和验收控制形成可评分、可落地的技术方案内容。",
+                "score": None,
+                "children": [
+                    self.outline_child("项目整体理解与关键点分析", ["项目背景与建设目标", "关键需求识别", "技术难点与风险判断"]),
+                    self.outline_child("总体技术架构与部署方案", ["总体架构设计", "系统部署拓扑", "关键组件协同机制"]),
+                    self.outline_child("核心能力响应方案", ["功能能力匹配", "性能与可靠性设计", "安全防护能力说明"]),
+                    self.outline_child("安全策略与配置方案", ["策略规划原则", "访问控制与防护策略", "日志审计与告警联动"]),
+                    self.outline_child("实施计划与交付路径", ["阶段划分与里程碑", "实施步骤安排", "交付物清单"]),
+                    self.outline_child("测试验收与风险控制", ["测试验证方法", "验收指标与证据", "风险识别与处置"]),
+                ],
+                "relatedScoringItems": scoring_items,
+            },
+            {
+                "level": 1,
+                "title": "服务方案",
+                "writingGoal": "围绕服务组织、人员保障、响应速度、故障处理和持续运营形成可执行、可考核的服务方案内容。",
+                "score": None,
+                "children": [
+                    self.outline_child("人员配备", ["项目角色分工", "专业能力配置", "人员投入与备份机制"]),
+                    self.outline_child("响应速度", ["服务响应分级", "响应时限承诺", "升级通报机制"]),
+                    self.outline_child("服务组织计划", ["服务组织架构", "服务流程安排", "沟通协调机制"]),
+                    self.outline_child("故障处理措施", ["故障定位流程", "应急处置步骤", "复盘改进机制"]),
+                    self.outline_child("日常维护与巡检方案", ["巡检频率与内容", "维护作业记录", "隐患跟踪闭环"]),
+                    self.outline_child("服务质量保障方案", ["质量管理指标", "服务过程监督", "满意度与改进机制"]),
+                    self.outline_child("培训与知识转移方案", ["培训对象与课程", "培训实施安排", "资料移交与答疑支持"]),
+                ],
+                "relatedScoringItems": scoring_items,
+            },
+        ]
+
+    def is_two_section_outline_request(self, message):
+        return (
+            "技术方案" in message
+            and "服务方案" in message
+            and any(keyword in message for keyword in ["两个大标题", "2个大标题", "限定两个", "限定2个", "只有两个"])
+        )
+
+    def outline_child(self, title, children):
+        return {
+            "level": 2,
+            "title": title,
+            "children": [
+                {
+                    "level": 3,
+                    "title": child,
+                    "children": []
+                }
+                for child in children
+            ],
+        }
+
+    def adjust_outline_with_llm(self, outline, message):
+        prompt = f"""
+你是一名网络安全售前方案大纲编辑智能体。请根据用户要求调整投标方案大纲。
+
+用户要求：
+{message}
+
+当前大纲 JSON：
+{json.dumps(outline, ensure_ascii=False, indent=2)}
+
+请只输出 JSON，不要解释。格式必须为：
+{{
+  "sections": [
+    {{
+      "level": 1,
+      "title": "章节名称",
+      "writingGoal": "章节写作目标",
+      "score": null,
+      "children": [
+        {{
+          "level": 2,
+          "title": "二级标题",
+          "children": [
+            {{
+              "level": 3,
+              "title": "三级标题",
+              "children": [{{"level": 4, "title": "四级标题"}}]
+            }}
+          ]
+        }}
+      ],
+      "relatedScoringItems": []
+    }}
+  ]
+}}
+
+调整要求：
+1. 避免章节名称雷同，优先体现项目差异、技术路线、交付成果和验收口径。
+2. 可以增删改章节、调整顺序、细化二级/三级/四级标题。
+3. 每个一级章节最多 7 个二级标题；三级标题用于展开方法、流程、交付物、风险控制。
+4. 保留 relatedScoringItems 字段，没有就使用空数组。
+5. 不要输出 Markdown。
+"""
+        text = self.call_configured_llm(prompt)
+        return self.parse_outline_response(text)
+
+    def parse_outline_response(self, text):
+        if not text:
+            return []
+        candidate = text.strip()
+        fenced = re.search(r"```(?:json)?\s*(.*?)```", candidate, flags=re.S)
+        if fenced:
+            candidate = fenced.group(1).strip()
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start >= 0 and end > start:
+            candidate = candidate[start : end + 1]
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            return []
+        sections = data.get("sections") if isinstance(data, dict) else data
+        if not isinstance(sections, list):
+            return []
+        return [self.normalize_outline_section(section, 1) for section in sections if isinstance(section, dict)]
+
+    def normalize_outline_section(self, section, level):
+        title = self.clean_text(section.get("title") or f"未命名章节")
+        normalized = {
+            "level": level,
+            "title": title,
+            "writingGoal": self.clean_text(section.get("writingGoal") or f"围绕“{title}”形成可交付、可验收的方案内容。"),
+            "score": section.get("score"),
+            "children": [
+                self.normalize_outline_section(child, min(level + 1, 4))
+                for child in section.get("children", [])
+                if isinstance(child, dict) and self.clean_text(child.get("title", ""))
+            ][:7 if level == 1 else 5],
+            "relatedScoringItems": section.get("relatedScoringItems") if isinstance(section.get("relatedScoringItems"), list) else [],
+        }
+        if level > 1:
+            normalized.pop("writingGoal", None)
+            normalized.pop("score", None)
+            normalized.pop("relatedScoringItems", None)
+        return normalized
+
+    def adjust_outline_locally(self, outline, message):
+        updated = json.loads(json.dumps(outline, ensure_ascii=False))
+        if any(keyword in message for keyword in ["去掉", "删除", "移除"]) and any(keyword in message for keyword in ["第一章", "第1章", "首章"]):
+            updated = updated[1:]
+        if any(keyword in message for keyword in ["更细", "细化", "更多层级", "丰富"]):
+            for section in updated:
+                for child in section.get("children", []):
+                    child.setdefault("children", [
+                        {"level": 3, "title": "方法与路径", "children": [{"level": 4, "title": "执行动作"}, {"level": 4, "title": "输出材料"}]},
+                        {"level": 3, "title": "验收与闭环", "children": [{"level": 4, "title": "检查口径"}, {"level": 4, "title": "客户确认"}]},
+                    ])
+        return updated
+
+    def diversify_outline_titles(self, sections):
+        seen_in_outline = {}
+        for section in sections:
+            children = section.get("children", [])
+            self.diversify_sibling_titles(children, section.get("title", ""))
+            for child in children:
+                self.diversify_outline_subtree(child, section.get("title", ""), seen_in_outline)
+        return sections
+
+    def diversify_outline_subtree(self, node, parent_title, seen):
+        title = self.clean_text(node.get("title", ""))
+        level = int(node.get("level", 2) or 2)
+        key = (level, title)
+        seen[key] = seen.get(key, 0) + 1
+        if level >= 2 and seen[key] > 1:
+            node["title"] = self.unique_outline_title(parent_title, title, seen[key])
+
+        children = node.get("children", [])
+        if children:
+            self.diversify_sibling_titles(children, node.get("title", title))
+            for child in children:
+                self.diversify_outline_subtree(child, node.get("title", title), seen)
+
+    def diversify_sibling_titles(self, nodes, parent_title):
+        seen = {}
+        for node in nodes:
+            title = self.clean_text(node.get("title", ""))
+            seen[title] = seen.get(title, 0) + 1
+            if seen[title] > 1:
+                node["title"] = self.unique_outline_title(parent_title, title, seen[title])
+
+    def unique_outline_title(self, parent_title, title, index):
+        parent = re.sub(r"[一二三四五六七八九十0-9、.．\s]+$", "", self.clean_text(parent_title))
+        parent = parent[:12] or "本项"
+        replacements = {
+            "现状与目标": "现状识别",
+            "实施思路": "实施路径",
+            "输出成果": "交付成果",
+            "方法与路径": "执行路径",
+            "验收与闭环": "验收闭环",
+            "执行动作": "关键动作",
+            "输出材料": "交付材料",
+            "检查口径": "验收口径",
+            "客户确认": "确认机制",
+        }
+        base = replacements.get(title, title or f"细化要点{index}")
+        if base.startswith(parent):
+            return base
+        return f"{parent}{base}"
 
     def build_proposal_detail(self, job_dir, manifest, pipeline_result):
         job_id = job_dir.name
@@ -693,7 +971,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
                     base_progress=child_progress,
                 ):
                     self.add_body_paragraph(document, paragraph)
-                self.add_outline_substructure(document, child, title)
+                self.add_outline_substructure(document, child, title, section, technical_signals)
                 child_chars = self.document_text_length(document) - child_start_chars
                 completed_children += 1
                 child_stats.append({
@@ -735,25 +1013,69 @@ class ProposalHandler(SimpleHTTPRequestHandler):
         paragraph.paragraph_format.first_line_indent = BODY_FIRST_LINE_INDENT
         return paragraph
 
-    def add_outline_substructure(self, document, node, section_title):
+    def add_outline_substructure(self, document, node, section_title, section=None, technical_signals=None):
         children = node.get("children") or []
         if not children:
             return
+        section = section or {}
+        technical_signals = technical_signals or []
+        scoring_items = section.get("relatedScoringItems") or []
+        scoring_text = self.clean_text(scoring_items[0]) if scoring_items else "围绕评分标准要求进行针对性响应。"
+        context = self.context_summary(technical_signals)
         for child in children:
             level = min(max(int(child.get("level", 3)), 3), 4)
-            document.add_heading(child.get("title", "细化内容"), level=level)
+            child_title = child.get("title", "细化内容")
+            document.add_heading(child_title, level=level)
             leaf_titles = [leaf.get("title", "") for leaf in child.get("children", []) if leaf.get("title")]
             if leaf_titles:
+                for paragraph in self.compose_subsection_paragraphs(section_title, node.get("title", ""), child_title, scoring_text, context):
+                    self.add_body_paragraph(document, paragraph)
                 self.add_bullet_list(document, leaf_titles)
                 self.add_check_table(document, child.get("title", ""), leaf_titles[:3])
             else:
-                self.add_body_paragraph(document, f"本部分围绕“{child.get('title', '')}”补充执行动作、输出材料和检查口径。")
+                for paragraph in self.compose_subsection_paragraphs(section_title, node.get("title", ""), child_title, scoring_text, context):
+                    self.add_body_paragraph(document, paragraph)
         self.add_callout(document, f"{node.get('title', '本小节')}应与评分条款、交付物清单和验收记录形成对应关系，避免只描述原则而缺少过程支撑。")
 
+    def compose_subsection_paragraphs(self, section_title, parent_title, child_title, scoring_text, context):
+        profile = self.subtitle_profile(section_title, child_title)
+        context_points = self.context_points(context)
+        context_point = self.choose_context_point(section_title, child_title, context_points, 0) if context_points else profile["problem"]
+        scoring_brief = self.scoring_brief(scoring_text)
+        return [
+            (
+                f"在“{parent_title}”下设置“{child_title}”，主要用于把{profile['object']}落到可执行层面。"
+                f"本部分围绕{profile['action']}展开，结合评分关注的“{scoring_brief}”，明确服务方需要完成的动作、形成的材料以及客户侧确认方式。"
+            ),
+            (
+                f"执行过程中，项目组先围绕“{context_point}”确认输入条件和工作边界，再安排责任角色推进具体任务。"
+                f"每项动作均通过{profile['evidence']}留痕，避免三级小节只保留标题而缺少可复核内容。"
+            ),
+            (
+                f"验收方面，“{child_title}”以{profile['metric']}作为检查口径。"
+                f"若发现{profile['risk']}等风险，项目组应及时记录影响范围、处置措施和复核结论，并在阶段汇报中向客户确认闭环状态。"
+            ),
+        ]
+
     def add_bullet_list(self, document, items):
+        style = self.first_existing_style(document, ["List Bullet", "List Paragraph", "列表段落"])
         for item in items[:5]:
-            paragraph = document.add_paragraph(style="List Bullet")
-            paragraph.add_run(item)
+            if style:
+                paragraph = document.add_paragraph(style=style)
+                paragraph.add_run(item)
+            else:
+                paragraph = document.add_paragraph(f"• {item}")
+                paragraph.paragraph_format.first_line_indent = None
+                paragraph.paragraph_format.left_indent = Pt(18)
+
+    def first_existing_style(self, document, names):
+        for name in names:
+            try:
+                document.styles[name]
+                return name
+            except KeyError:
+                continue
+        return ""
 
     def add_callout(self, document, text):
         table = document.add_table(rows=1, cols=1)

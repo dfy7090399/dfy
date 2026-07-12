@@ -320,7 +320,10 @@
                 <section class="outline-panel">
                     <div class="outline-header">
                         <h3>生成大纲</h3>
-                        <span id="outlineStatus">等待生成</span>
+                        <div class="outline-header-actions">
+                            <span id="outlineStatus">等待生成</span>
+                            <button type="button" id="openOutlineChatBtn" class="mini-action" disabled>对话调整</button>
+                        </div>
                     </div>
                     <div id="outlineOutput" class="outline-output empty">上传材料并生成后，会在这里展示可确认的大纲。</div>
                 </section>
@@ -350,6 +353,23 @@
             </section>
         </section>
     </main>
+    <dialog id="outlineChatDialog" class="outline-chat-dialog">
+        <form method="dialog" class="dialog-shell">
+            <div class="dialog-header">
+                <h3>对话调整大纲</h3>
+                <button type="button" id="closeOutlineChatBtn" class="icon-action" aria-label="关闭">×</button>
+            </div>
+            <div id="outlineChatMessages" class="outline-chat-messages" aria-live="polite"></div>
+            <label class="outline-chat-input">
+                <span>调整要求</span>
+                <textarea id="outlineChatInput" rows="4" placeholder="例如：减少雷同标题，增加验收口径、交付物、实施路径，并删除第一章概述。"></textarea>
+            </label>
+            <div class="dialog-actions">
+                <button type="button" id="sendOutlineChatBtn">提交调整</button>
+                <button type="button" id="cancelOutlineChatBtn" class="secondary">取消</button>
+            </div>
+        </form>
+    </dialog>
     <script src="app.js"></script>
 </body>
 </html>
