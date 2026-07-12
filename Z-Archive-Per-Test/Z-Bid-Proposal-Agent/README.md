@@ -77,7 +77,7 @@ config/model-config.json
 cp config/model-config.local.example.json config/model-config.local.json
 ```
 
-`config/model-config.local.json` 已加入 `.gitignore`，可用于本机覆盖模型、API 地址或 API Key，不会提交到仓库。推荐优先使用环境变量保存密钥：
+`config/model-config.local.json` 已加入 `.gitignore`，可用于本机覆盖模型和 API 地址，不会提交到仓库。出于安全原因，Web 页面保存的 API Key 不再落盘，只保留在当前服务进程内存中；如需长期保存，请优先使用环境变量：
 
 ```bash
 export OPENAI_API_KEY="你的 API Key"

@@ -8,6 +8,8 @@ from xml.etree import ElementTree
 
 
 WORD_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+MAX_DOCX_XML_BYTES = 10 * 1024 * 1024
+DTD_MARKERS = (b"<!DOCTYPE", b"<!ENTITY")
 
 
 def read_text(path: Path) -> str:
@@ -27,7 +29,14 @@ def read_text(path: Path) -> str:
 
 def read_docx_text(path: Path) -> str:
     with zipfile.ZipFile(path) as archive:
+        document_info = archive.getinfo("word/document.xml")
+        if document_info.file_size > MAX_DOCX_XML_BYTES:
+            raise ValueError("DOCX 文档内容过大，已拒绝解析")
         document_xml = archive.read("word/document.xml")
+
+    upper_xml = document_xml.upper()
+    if any(marker in upper_xml for marker in DTD_MARKERS):
+        raise ValueError("DOCX 包含不安全的 XML 实体定义，已拒绝解析")
 
     root = ElementTree.fromstring(document_xml)
     lines: list[str] = []

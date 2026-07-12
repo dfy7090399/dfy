@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import cgi
+import ipaddress
 import json
+import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+from http.cookies import SimpleCookie
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 from docx import Document
 from docx.shared import Pt
@@ -36,8 +40,27 @@ TARGET_CHARS_PER_PAGE = 590
 MIN_CHILD_CHARS = 260
 BODY_FIRST_LINE_INDENT = Pt(28)
 COMPOSE_STATUS_FILE = "compose-status.json"
+ACCESS_CONTROL_FILE = ".access.json"
 ACTIVE_COMPOSE_TASKS: set[str] = set()
 ACTIVE_COMPOSE_LOCK = threading.Lock()
+SESSION_COOKIE_NAME = "bid_proposal_session"
+MAX_JSON_BODY_BYTES = 256 * 1024
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_MULTIPART_BYTES = 25 * 1024 * 1024
+MAX_DOCX_XML_BYTES = 10 * 1024 * 1024
+ALLOWED_OPENAI_HOSTS = {"api.openai.com"}
+ALLOWED_OPENAI_SUFFIXES = (".openai.azure.com", ".services.ai.azure.com")
+ALLOWED_ANTHROPIC_HOSTS = {"api.anthropic.com"}
+DISALLOWED_FILE_SEGMENTS = {"uploads", COMPOSE_STATUS_FILE, ACCESS_CONTROL_FILE}
+ALLOWED_UPLOAD_SUFFIXES = {
+    "technicalSpecification": {".txt", ".md", ".csv", ".docx", ".xlsx", ".xls", ".json"},
+    "scoringCriteria": {".txt", ".md", ".csv", ".docx", ".xlsx", ".xls", ".json"},
+    "templateFile": {".docx"},
+}
+RUNTIME_SECRETS = {
+    "anthropic": "",
+    "openai": "",
+}
 
 DEFAULT_MODEL_CONFIG = {
     "writer": {
@@ -114,10 +137,49 @@ def env_bool(name, default):
 
 class ProposalHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
+        self._session_cookie_value = None
         super().__init__(*args, directory=str(SRC_DIR), **kwargs)
+
+    def end_headers(self):
+        if self._session_cookie_value:
+            self.send_header(
+                "Set-Cookie",
+                f"{SESSION_COOKIE_NAME}={self._session_cookie_value}; Path=/; HttpOnly; SameSite=Strict",
+            )
+            self._session_cookie_value = None
+        super().end_headers()
+
+    def current_session_id(self):
+        cookie_header = self.headers.get("Cookie", "")
+        if not cookie_header:
+            return ""
+        cookie = SimpleCookie()
+        try:
+            cookie.load(cookie_header)
+        except Exception:
+            return ""
+        morsel = cookie.get(SESSION_COOKIE_NAME)
+        if not morsel:
+            return ""
+        return morsel.value.strip()
+
+    def ensure_session(self):
+        session_id = self.current_session_id()
+        if session_id:
+            return session_id
+        session_id = uuid.uuid4().hex
+        self._session_cookie_value = session_id
+        return session_id
+
+    def require_session(self):
+        session_id = self.current_session_id()
+        if not session_id:
+            raise PermissionError("当前会话未授权，请先刷新页面后重试")
+        return session_id
 
     def do_POST(self):
         try:
+            self.require_session()
             if self.path == "/api/model-config":
                 response = self.handle_model_config_save()
                 self.send_json(response, HTTPStatus.OK)
@@ -150,53 +212,82 @@ class ProposalHandler(SimpleHTTPRequestHandler):
         except ValueError as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
+        except PermissionError as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
+            return
         except Exception as exc:  # pragma: no cover - local server guardrail
+            logging.exception("Unhandled POST error")
             self.send_json({"error": f"处理失败：{exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
     def do_GET(self):
+        if not self.path.startswith("/api/") and not self.path.startswith("/output/"):
+            self.ensure_session()
+
         if self.path == "/api/model-config":
-            self.send_json(self.handle_model_config_read(), HTTPStatus.OK)
+            try:
+                self.require_session()
+                self.send_json(self.handle_model_config_read(), HTTPStatus.OK)
+            except PermissionError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
             return
 
         if self.path == "/api/proposals/latest":
             try:
+                self.require_session()
                 self.send_json(self.handle_latest_proposal(), HTTPStatus.OK)
             except ValueError as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            except PermissionError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
             return
 
         if self.path.startswith("/api/proposals/") and self.path.endswith("/compose/status"):
             try:
+                self.require_session()
                 job_id = self.path.removeprefix("/api/proposals/").removesuffix("/compose/status").strip("/")
                 self.send_json(self.handle_compose_status(job_id), HTTPStatus.OK)
             except ValueError as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except PermissionError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
             return
 
         if self.path.startswith("/api/proposals/"):
             try:
+                self.require_session()
                 job_id = self.path.removeprefix("/api/proposals/").strip("/")
                 self.send_json(self.handle_proposal_detail(job_id), HTTPStatus.OK)
             except ValueError as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            except PermissionError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
             return
 
         if self.path.startswith("/output/"):
-            self.serve_output_file()
+            try:
+                self.require_session()
+                self.serve_output_file()
+            except PermissionError as exc:
+                self.send_error(HTTPStatus.FORBIDDEN, str(exc))
             return
 
         super().do_GET()
 
     def do_HEAD(self):
         if self.path.startswith("/output/"):
-            self.serve_output_file()
+            try:
+                self.require_session()
+                self.serve_output_file()
+            except PermissionError as exc:
+                self.send_error(HTTPStatus.FORBIDDEN, str(exc))
             return
 
+        self.ensure_session()
         super().do_HEAD()
 
     def handle_model_config_read(self):
-        config = load_model_config()
+        config = self.config_for_display()
         return {
             "config": self.mask_model_config(config),
             "activeProvider": self.active_writer_provider(),
@@ -214,13 +305,17 @@ class ProposalHandler(SimpleHTTPRequestHandler):
         anthropic_key = payload.get("anthropicApiKey", "")
         openai_key = payload.get("openaiApiKey", "")
         if not anthropic_key or anthropic_key == "********":
-            anthropic_key = current_env.get("ANTHROPIC_AUTH_TOKEN", "")
+            anthropic_key = RUNTIME_SECRETS["anthropic"] or current_env.get("ANTHROPIC_AUTH_TOKEN", "")
         if not openai_key or openai_key == "********":
-            openai_key = current_openai.get("apiKey", "")
+            openai_key = RUNTIME_SECRETS["openai"] or current_openai.get("apiKey", "")
+        anthropic_base_url = self.validate_base_url(payload.get("anthropicBaseUrl", ""), "anthropic", allow_blank=True)
+        openai_base_url = self.validate_base_url(payload.get("openaiBaseUrl", "https://api.openai.com/v1"), "openai")
+        RUNTIME_SECRETS["anthropic"] = anthropic_key
+        RUNTIME_SECRETS["openai"] = openai_key
         config = {
             "env": {
-                "ANTHROPIC_AUTH_TOKEN": anthropic_key,
-                "ANTHROPIC_BASE_URL": payload.get("anthropicBaseUrl", ""),
+                "ANTHROPIC_AUTH_TOKEN": "",
+                "ANTHROPIC_BASE_URL": anthropic_base_url,
                 "ANTHROPIC_MODEL": payload.get("anthropicModel", ""),
             },
             "writer": {
@@ -233,17 +328,18 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             },
             "openai": {
                 "enabled": bool(payload.get("openaiEnabled", True)),
-                "baseUrl": payload.get("openaiBaseUrl", "https://api.openai.com/v1"),
+                "baseUrl": openai_base_url,
                 "model": payload.get("openaiModel", "gpt-4o-mini"),
                 "apiKeyEnv": payload.get("openaiApiKeyEnv", "OPENAI_API_KEY"),
-                "apiKey": openai_key,
+                "apiKey": "",
             },
         }
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         MODEL_CONFIG_LOCAL_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.chmod(MODEL_CONFIG_LOCAL_FILE, 0o600)
         return {
-            "message": "模型配置已保存到本地配置文件",
-            "config": self.mask_model_config(load_model_config()),
+            "message": "模型配置已保存，API Key 仅保留在当前服务进程内存中",
+            "config": self.mask_model_config(self.config_for_display()),
             "activeProvider": self.active_writer_provider(),
             "engine": self.writer_engine_name(),
             "model": self.writer_model_name(),
@@ -283,12 +379,77 @@ class ProposalHandler(SimpleHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0") or 0)
         if length <= 0:
             return {}
+        if length > MAX_JSON_BODY_BYTES:
+            raise ValueError("JSON 请求体过大")
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
+    def config_for_display(self):
+        config = load_model_config()
+        if RUNTIME_SECRETS["anthropic"]:
+            config.setdefault("env", {})["ANTHROPIC_AUTH_TOKEN"] = "********"
+        if RUNTIME_SECRETS["openai"]:
+            config.setdefault("openai", {})["apiKey"] = "********"
+        return config
+
+    def validate_base_url(self, raw_value, provider, allow_blank=False):
+        value = (raw_value or "").strip()
+        if not value:
+            if allow_blank:
+                return ""
+            raise ValueError("模型基础地址不能为空")
+
+        parsed = urlsplit(value)
+        if parsed.scheme != "https":
+            raise ValueError("模型基础地址必须使用 https")
+        if not parsed.netloc or parsed.username or parsed.password:
+            raise ValueError("模型基础地址格式不合法")
+        if parsed.query or parsed.fragment:
+            raise ValueError("模型基础地址不能包含查询串或片段")
+
+        hostname = (parsed.hostname or "").lower()
+        if not hostname:
+            raise ValueError("模型基础地址缺少主机名")
+        if self.host_is_private(hostname):
+            raise ValueError("模型基础地址不能指向内网或保留地址")
+
+        if provider == "openai":
+            if hostname not in ALLOWED_OPENAI_HOSTS and not hostname.endswith(ALLOWED_OPENAI_SUFFIXES):
+                raise ValueError("OpenAI 基础地址不在允许列表内")
+        elif provider == "anthropic":
+            if hostname not in ALLOWED_ANTHROPIC_HOSTS:
+                raise ValueError("Anthropic 基础地址不在允许列表内")
+
+        path = parsed.path.rstrip("/")
+        return f"https://{parsed.netloc}{path}"
+
+    def host_is_private(self, hostname):
+        try:
+            infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+        except socket.gaierror:
+            return False
+        for info in infos:
+            address = info[4][0]
+            try:
+                ip = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+                return True
+        return False
+
+    def no_redirect_open(self, request, timeout=60):
+        class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        opener = urllib.request.build_opener(NoRedirectHandler)
+        return opener.open(request, timeout=timeout)
+
     def handle_latest_proposal(self):
+        session_id = self.require_session()
         job_dirs = [
             path for path in OUTPUT_DIR.iterdir()
-            if path.is_dir() and (path / "manifest.json").exists()
+            if path.is_dir() and (path / "manifest.json").exists() and self.job_belongs_to_session(path, session_id)
         ]
         if not job_dirs:
             raise ValueError("暂无历史任务")
@@ -317,6 +478,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             raise ValueError("任务清单不存在")
 
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.authorize_job_access(job_dir, manifest)
         pipeline_result = {}
         pipeline_path = job_dir / "pipeline-result.json"
         if pipeline_path.exists():
@@ -332,6 +494,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
         job_dir = (OUTPUT_DIR / safe_job_id(job_id)).resolve()
         if not str(job_dir).startswith(str(OUTPUT_DIR.resolve())) or not job_dir.is_dir():
             raise ValueError("任务不存在")
+        self.authorize_job_access(job_dir)
 
         payload = self.parse_json_body()
         message = self.clean_text(payload.get("message", ""))
@@ -617,6 +780,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
         form = self.parse_multipart_form()
         config = self.parse_config(form)
         self.validate_required_files(form)
+        session_id = self.require_session()
 
         job_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:8]
         job_dir = OUTPUT_DIR / job_id
@@ -625,13 +789,13 @@ class ProposalHandler(SimpleHTTPRequestHandler):
         upload_dir.mkdir(parents=True, exist_ok=True)
 
         files = {
-            "technicalSpecification": self.save_upload(form["technicalSpecification"], upload_dir),
-            "scoringCriteria": self.save_upload(form["scoringCriteria"], upload_dir),
+            "technicalSpecification": self.save_upload("technicalSpecification", form["technicalSpecification"], upload_dir),
+            "scoringCriteria": self.save_upload("scoringCriteria", form["scoringCriteria"], upload_dir),
         }
 
         template_upload = form.getfirst("templateFile")
         if "templateFile" in form and getattr(form["templateFile"], "filename", ""):
-            files["proposalTemplate"] = self.save_upload(form["templateFile"], upload_dir)
+            files["proposalTemplate"] = self.save_upload("templateFile", form["templateFile"], upload_dir)
             template_source = "uploaded"
         else:
             files["proposalTemplate"] = self.copy_default_template(job_dir)
@@ -661,6 +825,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
 
         manifest_path = job_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        (job_dir / ACCESS_CONTROL_FILE).write_text(json.dumps({"ownerSessionId": session_id}, ensure_ascii=False), encoding="utf-8")
 
         return {
             "message": "方案生成任务已创建",
@@ -682,6 +847,9 @@ class ProposalHandler(SimpleHTTPRequestHandler):
         pipeline_path = job_dir / "pipeline-result.json"
         if not manifest_path.exists() or not pipeline_path.exists():
             raise ValueError("任务缺少大纲结果，请重新生成大纲")
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.authorize_job_access(job_dir, manifest)
 
         status = self.read_compose_status(job_dir)
 
@@ -716,6 +884,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
         job_dir = (OUTPUT_DIR / safe_job_id(job_id)).resolve()
         if not str(job_dir).startswith(str(OUTPUT_DIR.resolve())) or not job_dir.is_dir():
             raise ValueError("任务不存在")
+        self.authorize_job_access(job_dir)
         return self.compose_status_for_response(job_id, job_dir)
 
     def run_compose_task(self, job_id):
@@ -775,11 +944,11 @@ class ProposalHandler(SimpleHTTPRequestHandler):
                 "completedAt": datetime.now(timezone.utc).isoformat(),
             })
         except Exception as exc:
+            logging.exception("Compose task failed for %s", job_id)
             self.update_compose_status(job_dir, {
                 "state": "failed",
                 "stage": "failed",
-                "message": f"正式编写失败：{exc}",
-                "error": str(exc),
+                "message": "正式编写失败，请检查输入材料或查看服务器日志",
             })
         finally:
             with ACTIVE_COMPOSE_LOCK:
@@ -801,6 +970,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
 
     def compose_status_for_response(self, job_id, job_dir):
         status = self.read_compose_status(job_dir)
+        status.pop("error", None)
         status.setdefault("engine", self.writer_engine_name())
         status.setdefault("model", self.writer_model_name())
         if status.get("state") in {"queued", "running"}:
@@ -1343,7 +1513,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
     def call_anthropic_messages(self, prompt):
         config = self.anthropic_config()
         api_key = self.anthropic_api_key()
-        base_url = (config.get("baseUrl") or "").rstrip("/")
+        base_url = self.anthropic_base_url()
         model = self.anthropic_model()
         if not (api_key and base_url and model):
             return ""
@@ -1366,7 +1536,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=int(config.get("timeoutSeconds", 90))) as response:
+            with self.no_redirect_open(request, timeout=int(config.get("timeoutSeconds", 90))) as response:
                 data = json.loads(response.read().decode("utf-8"))
             content = data.get("content", [])
             return "\n".join(item.get("text", "") for item in content if isinstance(item, dict)).strip()
@@ -1396,7 +1566,7 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=int(config.get("timeoutSeconds", 90))) as response:
+            with self.no_redirect_open(request, timeout=int(config.get("timeoutSeconds", 90))) as response:
                 data = json.loads(response.read().decode("utf-8"))
             return data["choices"][0]["message"]["content"]
         except (urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError):
@@ -1448,18 +1618,23 @@ class ProposalHandler(SimpleHTTPRequestHandler):
     def anthropic_api_key(self):
         env = self.current_config_env()
         key_env = self.anthropic_config().get("apiKeyEnv", "ANTHROPIC_AUTH_TOKEN")
-        return os.environ.get(key_env) or env.get(key_env) or self.anthropic_config().get("apiKey", "")
+        return os.environ.get(key_env) or RUNTIME_SECRETS["anthropic"] or env.get(key_env) or self.anthropic_config().get("apiKey", "")
+
+    def anthropic_base_url(self):
+        value = os.environ.get("ANTHROPIC_BASE_URL") or self.current_config_env().get("ANTHROPIC_BASE_URL") or self.anthropic_config().get("baseUrl", "")
+        return self.validate_base_url(value, "anthropic", allow_blank=True)
 
     def openai_model(self):
         return os.environ.get("OPENAI_MODEL") or self.current_config_env().get("OPENAI_MODEL") or self.openai_config().get("model", "gpt-4o-mini")
 
     def openai_base_url(self):
-        return (os.environ.get("OPENAI_BASE_URL") or self.current_config_env().get("OPENAI_BASE_URL") or self.openai_config().get("baseUrl", "https://api.openai.com/v1")).rstrip("/")
+        value = os.environ.get("OPENAI_BASE_URL") or self.current_config_env().get("OPENAI_BASE_URL") or self.openai_config().get("baseUrl", "https://api.openai.com/v1")
+        return self.validate_base_url(value, "openai")
 
     def openai_api_key(self):
         env = self.current_config_env()
         key_env = os.environ.get("OPENAI_API_KEY_ENV") or env.get("OPENAI_API_KEY_ENV") or self.openai_config().get("apiKeyEnv", "OPENAI_API_KEY")
-        return os.environ.get(key_env) or env.get(key_env) or self.openai_config().get("apiKey", "") or os.environ.get("OPENAI_API_KEY", "")
+        return os.environ.get(key_env) or RUNTIME_SECRETS["openai"] or env.get(key_env) or self.openai_config().get("apiKey", "") or os.environ.get("OPENAI_API_KEY", "")
 
     def llm_enabled(self):
         return self.anthropic_enabled() or self.codex_enabled() or self.openai_enabled()
@@ -2140,6 +2315,12 @@ class ProposalHandler(SimpleHTTPRequestHandler):
         if not content_type.startswith("multipart/form-data"):
             raise ValueError("请求必须使用 multipart/form-data")
 
+        content_length = int(self.headers.get("Content-Length", "0") or 0)
+        if content_length <= 0:
+            raise ValueError("上传请求缺少有效的 Content-Length")
+        if content_length > MAX_MULTIPART_BYTES:
+            raise ValueError("上传文件过大，请压缩后重试")
+
         return cgi.FieldStorage(
             fp=self.rfile,
             headers=self.headers,
@@ -2169,16 +2350,35 @@ class ProposalHandler(SimpleHTTPRequestHandler):
             if field not in form or not getattr(form[field], "filename", ""):
                 raise ValueError(f"缺少必传文件：{label}")
 
-    def save_upload(self, item, upload_dir):
+    def validate_upload_name(self, field_name, filename):
+        suffix = Path(filename or "").suffix.lower()
+        allowed = ALLOWED_UPLOAD_SUFFIXES.get(field_name, set())
+        if suffix not in allowed:
+            raise ValueError(f"{field_name} 文件类型不受支持")
+
+    def save_upload(self, field_name, item, upload_dir):
+        self.validate_upload_name(field_name, item.filename)
         filename = safe_filename(item.filename)
         target = upload_dir / filename
-        with target.open("wb") as output:
-            shutil.copyfileobj(item.file, output)
+        written = 0
+        try:
+            with target.open("wb") as output:
+                while True:
+                    chunk = item.file.read(64 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_UPLOAD_BYTES:
+                        raise ValueError("单个上传文件超过大小限制")
+                    output.write(chunk)
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
 
         return {
             "filename": filename,
             "path": str(target.relative_to(BASE_DIR)),
-            "size": target.stat().st_size,
+            "size": written,
         }
 
     def copy_default_template(self, job_dir):
@@ -2197,14 +2397,49 @@ class ProposalHandler(SimpleHTTPRequestHandler):
 
     def serve_output_file(self):
         relative = unquote(self.path.removeprefix("/output/"))
+        relative_path = Path(relative)
+        if any(part in DISALLOWED_FILE_SEGMENTS for part in relative_path.parts):
+            self.send_error(HTTPStatus.NOT_FOUND, "Output file not found")
+            return
         target = (OUTPUT_DIR / relative).resolve()
         if not str(target).startswith(str(OUTPUT_DIR.resolve())) or not target.is_file():
             self.send_error(HTTPStatus.NOT_FOUND, "Output file not found")
             return
 
+        job_id = relative_path.parts[0] if relative_path.parts else ""
+        job_dir = (OUTPUT_DIR / safe_job_id(job_id)).resolve()
+        self.authorize_job_access(job_dir)
+
         self.path = "/output/" + relative
         self.directory = str(BASE_DIR)
         super().do_GET()
+
+    def job_belongs_to_session(self, job_dir, session_id):
+        try:
+            owner_session_id = self.owner_session_id_for_job(job_dir)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        return owner_session_id == session_id
+
+    def authorize_job_access(self, job_dir, manifest=None):
+        session_id = self.require_session()
+        owner_session_id = self.owner_session_id_for_job(job_dir, manifest=manifest)
+        if owner_session_id != session_id:
+            raise PermissionError("当前会话无权访问该任务")
+
+    def owner_session_id_for_job(self, job_dir, manifest=None):
+        access_path = job_dir / ACCESS_CONTROL_FILE
+        if access_path.exists():
+            data = json.loads(access_path.read_text(encoding="utf-8"))
+            owner_session_id = data.get("ownerSessionId", "")
+            if owner_session_id:
+                return owner_session_id
+        if manifest is None:
+            manifest_path = job_dir / "manifest.json"
+            if not manifest_path.exists():
+                raise ValueError("任务清单不存在")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return manifest.get("ownerSessionId", "")
 
     def send_json(self, payload, status):
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
@@ -2236,6 +2471,7 @@ def safe_job_id(job_id):
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer(("127.0.0.1", 8011), ProposalHandler)
     print("Bid Proposal Agent running at http://127.0.0.1:8011")
